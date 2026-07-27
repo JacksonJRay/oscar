@@ -35,6 +35,50 @@ impl Cloud {
             _ => None,
         }
     }
+
+    /// Stable id prefix used for oscar profile ids: `aws-…`, `gcp-…`, `azure-…`, `k8s-…`.
+    pub fn id_prefix(self) -> &'static str {
+        match self {
+            Cloud::Aws => "aws",
+            Cloud::Gcp => "gcp",
+            Cloud::Azure => "azure",
+            Cloud::K8s => "k8s",
+            Cloud::Multi => "multi",
+        }
+    }
+
+    /// Human label for lists / agent context (CSP distinction).
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Cloud::Aws => "AWS",
+            Cloud::Gcp => "GCP",
+            Cloud::Azure => "Azure",
+            Cloud::K8s => "Kubernetes",
+            Cloud::Multi => "Multi-cloud",
+        }
+    }
+
+    /// What `account_ref` means for this CSP (helps agents not confuse account vs project vs sub).
+    pub fn account_kind(self) -> &'static str {
+        match self {
+            Cloud::Aws => "account_id",
+            Cloud::Gcp => "project_id",
+            Cloud::Azure => "subscription_id",
+            Cloud::K8s => "cluster_or_context",
+            Cloud::Multi => "account_ref",
+        }
+    }
+
+    /// Short tag for UI tables: `[AWS]` `[GCP]` `[AZURE]` `[K8S]`.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Cloud::Aws => "[AWS]",
+            Cloud::Gcp => "[GCP]",
+            Cloud::Azure => "[AZURE]",
+            Cloud::K8s => "[K8S]",
+            Cloud::Multi => "[MULTI]",
+        }
+    }
 }
 
 /// Tool capability relative to the session mode gate.

@@ -458,17 +458,35 @@ impl Tool for SystemAccessReview {
                     continue;
                 }
             }
+            let csp_tag = match e.cloud.as_str() {
+                "aws" => "[AWS]",
+                "gcp" => "[GCP]",
+                "azure" => "[AZURE]",
+                "k8s" => "[K8S]",
+                "llm" => "[LLM]",
+                _ => "[?]",
+            };
+            let account_kind = match e.cloud.as_str() {
+                "aws" => "account_id",
+                "gcp" => "project_id",
+                "azure" => "subscription_id",
+                "k8s" => "cluster_or_context",
+                _ => "account_ref",
+            };
             let row = json!({
+                "csp": e.cloud,
+                "csp_tag": csp_tag,
                 "id": e.id,
                 "kind": e.kind,
-                "cloud": e.cloud,
                 "label": e.label,
+                "account_kind": account_kind,
                 "account_ref": e.account_ref,
                 "auth_source": e.auth_source,
                 "secrets_present": e.secrets_present, // kinds only
                 "validity": e.validity.as_str(),
                 "detail": e.detail,
                 "usable_now": matches!(e.validity, Validity::Valid),
+                "display": format!("{csp_tag} {} ({})", e.id, e.cloud),
             });
             if matches!(e.validity, Validity::Valid) {
                 usable.push(e.id.clone());
@@ -482,24 +500,48 @@ impl Tool for SystemAccessReview {
         }
 
         let preferred = ctx.preferred_profile_id.clone();
+        // Group entries by CSP for unambiguous AWS vs GCP vs Azure pivot.
+        let mut by_cloud = serde_json::Map::new();
+        for row in &rows {
+            let csp = row
+                .get("csp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("other")
+                .to_string();
+            by_cloud
+                .entry(csp)
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .unwrap()
+                .push(row.clone());
+        }
         ToolResult::success(
             format!(
-                "access review: {} shown · usable_now={} · need_auth={} · preferred={}",
+                "access review: {} shown · usable_now={} · need_auth={} · preferred={} · CSPs={}",
                 rows.len(),
                 usable.len(),
                 needs_auth.len(),
-                preferred.as_deref().unwrap_or("(none)")
+                preferred.as_deref().unwrap_or("(none)"),
+                by_cloud.keys().cloned().collect::<Vec<_>>().join(",")
             ),
             json!({
                 "preferred_profile_id": preferred,
                 "usable_profile_ids": usable,
                 "needs_auth_ids": needs_auth,
+                "by_cloud": by_cloud,
                 "entries": rows,
                 "notes": inv.notes,
+                "csp_legend": {
+                    "aws": "[AWS] account_id · profile ids aws-*",
+                    "gcp": "[GCP] project_id · profile ids gcp-*",
+                    "azure": "[AZURE] subscription_id · profile ids azure-*",
+                    "k8s": "[K8S] context/cluster · profile ids k8s-*",
+                },
                 "agent_guidance": [
+                    "Distinguish CSP by csp_tag / id prefix — never use an aws-* profile for Azure tools",
                     "If the target account is missing: system.access.prepare with cloud+account",
-                    "If profile exists but needs_auth: system.access.prepare again or ask user to secure-paste short-lived keys / SSO",
-                    "To pivot mid-session: system.access.select profile_id=… then pass profile_id on tools",
+                    "If profile exists but needs_auth: prepare again or secure-paste short-lived keys / SSO",
+                    "Pivot: system.access.select profile_id=aws-…|gcp-…|azure-…",
                     "Never request raw keys in chat; secure bar / oscar auth only",
                 ],
             }),
@@ -595,7 +637,7 @@ impl Tool for SystemProfilesList {
         META.get_or_init(|| ToolMeta {
             id: "system.profiles.list".into(),
             name: "List local oscar profiles".into(),
-            description: "List oscar cloud profile metadata from profiles.toml (ids, clouds, accounts, regions). No secrets. Use system.access.prepare to create; system.identities.list for live validity.".into(),
+            description: "List oscar cloud profiles grouped by CSP (AWS vs GCP vs Azure vs K8s). Ids are always prefixed aws-|gcp-|azure-|k8s-. Returns by_cloud map + flat list. No secrets. Filter with cloud=aws|gcp|azure|k8s.".into(),
             domain: ToolDomain::Meta,
             clouds: vec![Cloud::Multi],
             capability: Capability::Read,
@@ -605,6 +647,10 @@ impl Tool for SystemProfilesList {
                 "account".into(),
                 "list".into(),
                 "config".into(),
+                "aws".into(),
+                "gcp".into(),
+                "azure".into(),
+                "csp".into(),
             ],
             input_schema: json!({
                 "type": "object",
@@ -628,19 +674,44 @@ impl Tool for SystemProfilesList {
             .filter(|p| filter.map(|c| p.cloud == c).unwrap_or(true))
             .map(|p| {
                 json!({
+                    "csp": p.cloud.id_prefix(),
+                    "csp_tag": p.cloud.tag(),
+                    "csp_name": p.cloud.display_name(),
                     "id": p.id,
-                    "cloud": p.cloud.to_string(),
                     "label": p.label,
+                    "account_kind": p.cloud.account_kind(),
                     "account_ref": p.account_ref,
                     "default_region": p.default_region,
+                    "display": p.display_line(),
                 })
             })
             .collect();
+        let by_cloud = if filter.is_some() {
+            json!({ filter.unwrap().id_prefix(): rows.clone() })
+        } else {
+            ctx.profiles.by_cloud_json()
+        };
+        let counts = json!({
+            "aws": ctx.profiles.list().iter().filter(|p| p.cloud == Cloud::Aws).count(),
+            "gcp": ctx.profiles.list().iter().filter(|p| p.cloud == Cloud::Gcp).count(),
+            "azure": ctx.profiles.list().iter().filter(|p| p.cloud == Cloud::Azure).count(),
+            "k8s": ctx.profiles.list().iter().filter(|p| p.cloud == Cloud::K8s).count(),
+        });
         ToolResult::success(
-            format!("{} profile(s)", rows.len()),
+            format!(
+                "{} profile(s) · by CSP aws={} gcp={} azure={} k8s={}",
+                rows.len(),
+                counts["aws"],
+                counts["gcp"],
+                counts["azure"],
+                counts["k8s"]
+            ),
             json!({
+                "counts_by_csp": counts,
+                "by_cloud": by_cloud,
                 "profiles": rows,
-                "hint": "Create/sign-in: system.access.prepare with cloud (+ account/label). Live check: system.identities.list",
+                "id_convention": "aws-<label> | gcp-<label> | azure-<label> | k8s-<label>",
+                "hint": "Never confuse CSP profiles: ids and csp_tag always encode the cloud. Create: system.access.prepare cloud=aws|gcp|azure.",
             }),
         )
     }

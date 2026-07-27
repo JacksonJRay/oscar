@@ -873,16 +873,37 @@ async fn main() -> Result<()> {
                 ProfilesCmd::List => {
                     if store.list().is_empty() {
                         println!("(no profiles)");
+                        println!("# add: oscar profiles add --cloud aws|gcp|azure|k8s --label NAME --account ID");
                     } else {
-                        for p in store.list() {
-                            println!(
-                                "{}\t{}\t{}\t{}",
-                                p.id,
-                                p.cloud,
-                                p.label,
-                                p.account_ref
-                            );
+                        println!(
+                            "{:<8} {:<22} {:<14} {:<20} {:<16} {}",
+                            "CSP", "ID", "LABEL", "ACCOUNT_KIND", "ACCOUNT", "REGION"
+                        );
+                        println!("{}", "-".repeat(96));
+                        // Stable CSP order: AWS, GCP, Azure, K8s
+                        for cloud in [
+                            oscar_core::Cloud::Aws,
+                            oscar_core::Cloud::Gcp,
+                            oscar_core::Cloud::Azure,
+                            oscar_core::Cloud::K8s,
+                            oscar_core::Cloud::Multi,
+                        ] {
+                            for p in store.list().iter().filter(|p| p.cloud == cloud) {
+                                println!(
+                                    "{:<8} {:<22} {:<14} {:<20} {:<16} {}",
+                                    cloud.tag(),
+                                    p.id,
+                                    p.label,
+                                    cloud.account_kind(),
+                                    p.account_ref,
+                                    p.default_region.as_deref().unwrap_or("-")
+                                );
+                            }
                         }
+                        println!();
+                        println!(
+                            "# ids are CSP-prefixed (aws-… / gcp-… / azure-… / k8s-…) so profiles never collide across clouds"
+                        );
                     }
                 }
                 ProfilesCmd::Add {
@@ -2520,41 +2541,65 @@ fn run_identities(action: Option<IdentitiesCmd>, paths: &Paths) -> Result<()> {
         return Ok(());
     }
 
-    println!("┌─ oscar identities ────────────────────────────────────────────┐");
+    println!("┌─ oscar identities (by CSP: AWS · GCP · Azure · K8s · LLM) ─────┐");
     println!("│  {}  │", inv.summary_line());
     println!("└──────────────────────────────────────────────────────────────┘");
-    for e in &inv.entries {
-        let mark = match e.validity {
-            Validity::Valid => "OK ",
-            Validity::Expired => "EXP",
-            Validity::Invalid => "BAD",
-            Validity::Missing => "---",
-            Validity::Unknown => "???",
+    // Group print order for clear CSP distinction
+    let order = ["aws", "gcp", "azure", "k8s", "llm", "multi"];
+    let mut shown: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for csp in order {
+        let group: Vec<_> = inv.entries.iter().filter(|e| e.cloud == csp).collect();
+        if group.is_empty() {
+            continue;
+        }
+        let tag = match csp {
+            "aws" => "[AWS]",
+            "gcp" => "[GCP]",
+            "azure" => "[AZURE]",
+            "k8s" => "[K8S]",
+            "llm" => "[LLM]",
+            _ => "[MULTI]",
         };
+        println!("  {tag}");
+        for e in group {
+            shown.insert(e.id.clone());
+            let mark = match e.validity {
+                Validity::Valid => "OK ",
+                Validity::Expired => "EXP",
+                Validity::Invalid => "BAD",
+                Validity::Missing => "---",
+                Validity::Unknown => "???",
+            };
+            println!("    [{mark}] {:12} {}", format!("{:?}", e.kind), e.id);
+            println!("         source={}  {}", e.auth_source, e.detail);
+            if !e.secrets_present.is_empty() {
+                println!(
+                    "         secrets: {} (names only)",
+                    e.secrets_present.join(", ")
+                );
+            }
+            for c in &e.clusters {
+                println!(
+                    "         k8s [{}] {} — {}",
+                    c.validity.glyph(),
+                    c.name,
+                    c.detail
+                );
+            }
+        }
+    }
+    // Any leftover clouds (shouldn't happen)
+    for e in &inv.entries {
+        if shown.contains(&e.id) {
+            continue;
+        }
         println!(
-            "  [{mark}] {:12} {:6} {}",
-            format!("{:?}", e.kind),
+            "  [{}] {:?} {} {}",
             e.cloud,
-            e.id
+            e.kind,
+            e.id,
+            e.detail
         );
-        println!(
-            "         source={}  {}",
-            e.auth_source, e.detail
-        );
-        if !e.secrets_present.is_empty() {
-            println!(
-                "         secrets: {} (names only)",
-                e.secrets_present.join(", ")
-            );
-        }
-        for c in &e.clusters {
-            println!(
-                "         k8s [{}] {} — {}",
-                c.validity.glyph(),
-                c.name,
-                c.detail
-            );
-        }
     }
     for n in &inv.notes {
         println!("  note: {n}");

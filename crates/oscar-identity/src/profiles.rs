@@ -21,15 +21,7 @@ pub struct Profile {
 impl Profile {
     pub fn new(cloud: Cloud, label: impl Into<String>, account_ref: impl Into<String>) -> Self {
         let label = label.into();
-        let id = format!(
-            "{}-{}",
-            cloud,
-            label
-                .to_ascii_lowercase()
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-                .collect::<String>()
-        );
+        let id = Self::make_id(cloud, &label);
         let secret_keyring_id = format!("oscar/{id}");
         Self {
             id,
@@ -40,6 +32,68 @@ impl Profile {
             clusters: vec![],
             secret_keyring_id,
         }
+    }
+
+    /// Build a CSP-prefixed profile id: `aws-prod`, `gcp-sandbox`, `azure-corp`, `k8s-prod`.
+    /// Strips a redundant leading cloud prefix from `label` so we never get `aws-aws-prod`.
+    pub fn make_id(cloud: Cloud, label: &str) -> String {
+        let prefix = cloud.id_prefix();
+        let mut slug = label
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>();
+        while slug.starts_with('-') {
+            slug = slug.trim_start_matches('-').to_string();
+        }
+        // Drop leading "aws-" / "gcp-" / etc. if the user already included it in the label.
+        for p in ["aws-", "gcp-", "azure-", "az-", "gcloud-", "k8s-", "kube-", "multi-"] {
+            if slug.starts_with(p) {
+                slug = slug[p.len()..].to_string();
+                break;
+            }
+        }
+        if slug.is_empty() {
+            slug = "default".into();
+        }
+        format!("{prefix}-{slug}")
+    }
+
+    /// Ensure an explicit id is namespaced under the correct CSP (disambiguate aws vs azure vs gcp).
+    pub fn normalize_id(cloud: Cloud, id: &str) -> String {
+        let id = id.trim().to_ascii_lowercase();
+        let prefix = format!("{}-", cloud.id_prefix());
+        if id.starts_with(&prefix) {
+            return id;
+        }
+        // Reject / re-prefix if id claims a *different* CSP.
+        for c in [Cloud::Aws, Cloud::Gcp, Cloud::Azure, Cloud::K8s, Cloud::Multi] {
+            let p = format!("{}-", c.id_prefix());
+            if id.starts_with(&p) && c != cloud {
+                // strip wrong prefix and re-apply correct one
+                let rest = &id[p.len()..];
+                return Self::make_id(cloud, rest);
+            }
+        }
+        Self::make_id(cloud, &id)
+    }
+
+    /// Human one-liner with CSP tag for agent/CLI lists.
+    pub fn display_line(&self) -> String {
+        let region = self
+            .default_region
+            .as_deref()
+            .map(|r| format!(" region={r}"))
+            .unwrap_or_default();
+        format!(
+            "{} id={} · {}={} · label={}{}",
+            self.cloud.tag(),
+            self.id,
+            self.cloud.account_kind(),
+            self.account_ref,
+            self.label,
+            region
+        )
     }
 }
 
@@ -137,6 +191,7 @@ impl ProfileStore {
         let label = label.into();
         let account_ref = account_ref.into();
         if let Some(id) = profile_id {
+            let id = Profile::normalize_id(cloud, id);
             if let Some(existing) = self.data.profiles.iter_mut().find(|p| p.id == id) {
                 if !account_ref.is_empty() && account_ref != "unknown" && account_ref != "pending" {
                     existing.account_ref = account_ref;
@@ -147,7 +202,7 @@ impl ProfileStore {
                 return (existing.clone(), false);
             }
             let mut p = Profile::new(cloud, label, account_ref);
-            p.id = id.to_string();
+            p.id = id.clone();
             p.secret_keyring_id = format!("oscar/{id}");
             p.default_region = region;
             self.upsert(p.clone());
@@ -196,36 +251,80 @@ impl ProfileStore {
         (p, true)
     }
 
-    /// Compact non-secret summary for the agent system context.
+    /// Compact non-secret summary for the agent system context — **grouped by CSP**.
     pub fn agent_summary(&self) -> String {
         if self.data.profiles.is_empty() {
-            return "No cloud profiles configured.".into();
+            return "No cloud profiles configured. Use system.access.prepare with cloud=aws|gcp|azure|k8s.".into();
         }
-        let mut lines = vec!["Known cloud profiles (metadata only; secrets in keychain):".to_string()];
-        for p in &self.data.profiles {
-            let region = p
-                .default_region
-                .as_deref()
-                .map(|r| format!(" region={r}"))
-                .unwrap_or_default();
-            let clusters = if p.clusters.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " clusters=[{}]",
-                    p.clusters
-                        .iter()
-                        .map(|c| c.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
+        let mut lines = vec![
+            "Known cloud profiles (metadata only; secrets in OS keychain per profile).".into(),
+            "Ids are CSP-prefixed so they never collide: aws-… · gcp-… · azure-… · k8s-…".into(),
+            "Filter tools/review by cloud; pass profile_id when pivoting accounts.".into(),
+        ];
+        for cloud in [Cloud::Aws, Cloud::Gcp, Cloud::Azure, Cloud::K8s, Cloud::Multi] {
+            let group: Vec<&Profile> = self
+                .data
+                .profiles
+                .iter()
+                .filter(|p| p.cloud == cloud)
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
             lines.push(format!(
-                "- id={} cloud={} label={} account={}{}{}",
-                p.id, p.cloud, p.label, p.account_ref, region, clusters
+                "\n### {} profiles ({}) — account field = {}",
+                cloud.display_name(),
+                cloud.tag(),
+                cloud.account_kind()
             ));
+            for p in group {
+                let clusters = if p.clusters.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " clusters=[{}]",
+                        p.clusters
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                lines.push(format!("- {}{}", p.display_line(), clusters));
+            }
         }
         lines.join("\n")
+    }
+
+    /// Profiles grouped by CSP for JSON tools (access.review / profiles.list).
+    pub fn by_cloud_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        let mut map = serde_json::Map::new();
+        for cloud in [Cloud::Aws, Cloud::Gcp, Cloud::Azure, Cloud::K8s, Cloud::Multi] {
+            let rows: Vec<_> = self
+                .data
+                .profiles
+                .iter()
+                .filter(|p| p.cloud == cloud)
+                .map(|p| {
+                    json!({
+                        "csp": cloud.id_prefix(),
+                        "csp_tag": cloud.tag(),
+                        "csp_name": cloud.display_name(),
+                        "id": p.id,
+                        "label": p.label,
+                        "account_kind": cloud.account_kind(),
+                        "account_ref": p.account_ref,
+                        "default_region": p.default_region,
+                        "display": p.display_line(),
+                    })
+                })
+                .collect();
+            if !rows.is_empty() {
+                map.insert(cloud.id_prefix().to_string(), json!(rows));
+            }
+        }
+        serde_json::Value::Object(map)
     }
 }
 
@@ -261,5 +360,22 @@ mod tests {
         );
         assert!(!created2);
         assert_eq!(p2.default_region.as_deref(), Some("eu-west-1"));
+    }
+
+    #[test]
+    fn profile_ids_are_csp_distinct() {
+        let aws = Profile::new(Cloud::Aws, "prod", "111");
+        let gcp = Profile::new(Cloud::Gcp, "prod", "my-proj");
+        let azure = Profile::new(Cloud::Azure, "prod", "sub-1");
+        assert_eq!(aws.id, "aws-prod");
+        assert_eq!(gcp.id, "gcp-prod");
+        assert_eq!(azure.id, "azure-prod");
+        assert_ne!(aws.id, gcp.id);
+        assert!(aws.display_line().contains("[AWS]"));
+        assert!(gcp.display_line().contains("[GCP]"));
+        assert!(azure.display_line().contains("[AZURE]"));
+        // Wrong prefix corrected
+        assert_eq!(Profile::normalize_id(Cloud::Aws, "azure-foo"), "aws-foo");
+        assert_eq!(Profile::normalize_id(Cloud::Gcp, "sandbox"), "gcp-sandbox");
     }
 }
