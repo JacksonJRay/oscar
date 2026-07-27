@@ -106,6 +106,57 @@ impl ProfileStore {
         self.data.profiles.len() != before
     }
 
+    /// Ensure a profile exists for `cloud` + `label` (or explicit id). Updates account/region when provided.
+    /// Returns `(profile, created)` where `created` is true if a new row was inserted.
+    pub fn ensure_profile(
+        &mut self,
+        cloud: Cloud,
+        label: impl Into<String>,
+        account_ref: impl Into<String>,
+        region: Option<String>,
+        profile_id: Option<&str>,
+    ) -> (Profile, bool) {
+        let label = label.into();
+        let account_ref = account_ref.into();
+        if let Some(id) = profile_id {
+            if let Some(existing) = self.data.profiles.iter_mut().find(|p| p.id == id) {
+                if !account_ref.is_empty() && account_ref != "unknown" && account_ref != "pending" {
+                    existing.account_ref = account_ref;
+                }
+                if let Some(r) = region {
+                    existing.default_region = Some(r);
+                }
+                return (existing.clone(), false);
+            }
+            let mut p = Profile::new(cloud, label, account_ref);
+            p.id = id.to_string();
+            p.secret_keyring_id = format!("oscar/{id}");
+            p.default_region = region;
+            self.upsert(p.clone());
+            return (p, true);
+        }
+        // Match by cloud+label id convention or existing cloud+label
+        let provisional = Profile::new(cloud, &label, &account_ref);
+        if let Some(existing) = self
+            .data
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == provisional.id || (p.cloud == cloud && p.label == label))
+        {
+            if !account_ref.is_empty() && account_ref != "unknown" && account_ref != "pending" {
+                existing.account_ref = account_ref;
+            }
+            if let Some(r) = region {
+                existing.default_region = Some(r);
+            }
+            return (existing.clone(), false);
+        }
+        let mut p = provisional;
+        p.default_region = region;
+        self.upsert(p.clone());
+        (p, true)
+    }
+
     /// Compact non-secret summary for the agent system context.
     pub fn agent_summary(&self) -> String {
         if self.data.profiles.is_empty() {
@@ -136,5 +187,40 @@ impl ProfileStore {
             ));
         }
         lines.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oscar_core::Cloud;
+
+    #[test]
+    fn ensure_profile_creates_and_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("profiles.toml");
+        let mut store = ProfileStore::load_path(&path).unwrap();
+        let (p1, created) = store.ensure_profile(
+            Cloud::Aws,
+            "prod",
+            "111122223333",
+            Some("us-east-1".into()),
+            None,
+        );
+        assert!(created);
+        assert_eq!(p1.id, "aws-prod");
+        assert_eq!(p1.account_ref, "111122223333");
+        store.save().unwrap();
+
+        let mut store2 = ProfileStore::load_path(&path).unwrap();
+        let (p2, created2) = store2.ensure_profile(
+            Cloud::Aws,
+            "prod",
+            "111122223333",
+            Some("eu-west-1".into()),
+            None,
+        );
+        assert!(!created2);
+        assert_eq!(p2.default_region.as_deref(), Some("eu-west-1"));
     }
 }

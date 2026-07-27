@@ -1,6 +1,8 @@
 //! Multi-cloud discovery tools — find where a domain/IP lives across CSPs.
 
-use crate::helpers::{load_dns_cache, load_dns_resolver_cache, load_network_cache};
+use crate::helpers::{
+    auth_prepare_request, load_dns_cache, load_dns_resolver_cache, load_network_cache, AuthPrefer,
+};
 use crate::pattern_schema::{discovery_blurb, discovery_tool_result, pattern_properties, to_tool_result};
 use crate::scan::{
     scan_dns_inventory, scan_dns_resolver_inventory, scan_network_inventory, PublicDnsProbe,
@@ -33,11 +35,15 @@ pub fn register_multi(registry: &mut ToolRegistry) {
     registry.register(Arc::new(SystemSkillsList));
     registry.register(Arc::new(SystemSkillsGet));
     registry.register(Arc::new(SystemIdentitiesList));
+    registry.register(Arc::new(SystemAccessPrepare));
+    registry.register(Arc::new(SystemProfilesList));
     registry.register(Arc::new(AccessTroubleshootGuide));
     registry.register(Arc::new(AccessPatternFind));
 }
 
 struct SystemIdentitiesList;
+struct SystemAccessPrepare;
+struct SystemProfilesList;
 
 struct SystemSkillsList;
 struct SystemSkillsGet;
@@ -103,6 +109,289 @@ impl Tool for SystemIdentitiesList {
             json!({
                 "inventory": inv,
                 "ui": "User can open /identities or Ctrl+I in TUI; CLI: oscar identities check",
+            }),
+        )
+    }
+}
+
+/// Create/update local oscar profile metadata so the user can sign in or paste short-lived keys.
+/// Does **not** store secrets; returns auth_required + operator steps for TUI secure bar / oscar auth.
+#[async_trait]
+impl Tool for SystemAccessPrepare {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "system.access.prepare".into(),
+            name: "Prepare cloud account access".into(),
+            description: "When the user wants to use a cloud/account (AWS account, GCP project, Azure subscription, or k8s), call this first. Creates or updates local oscar profile metadata under ~/.config/oscar/profiles.toml (no secrets). Returns how to sign in: SSO/browser (aws/gcloud/az), short-lived session keys, or keychain paste via TUI secure bar. Prefer over inventing CLI recipes. Never ask for secrets in chat.".into(),
+            domain: ToolDomain::Meta,
+            clouds: vec![Cloud::Multi, Cloud::Aws, Cloud::Gcp, Cloud::Azure, Cloud::K8s],
+            capability: Capability::Read,
+            tags: vec![
+                "access".into(),
+                "auth".into(),
+                "profile".into(),
+                "login".into(),
+                "sso".into(),
+                "credentials".into(),
+                "account".into(),
+                "onboard".into(),
+                "prepare".into(),
+                "sign-in".into(),
+                "aws".into(),
+                "gcp".into(),
+                "azure".into(),
+                "k8s".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "cloud": {
+                        "type": "string",
+                        "description": "aws | gcp | azure | k8s",
+                        "enum": ["aws", "gcp", "azure", "k8s"]
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Human label for the profile (e.g. prod, sandbox). Default: default"
+                    },
+                    "account": {
+                        "type": "string",
+                        "description": "Account id (AWS 12-digit) / GCP project id / Azure subscription id. Use 'pending' if unknown."
+                    },
+                    "region": {
+                        "type": "string",
+                        "description": "Default region (e.g. us-east-1) when known"
+                    },
+                    "profile_id": {
+                        "type": "string",
+                        "description": "Optional explicit oscar profile id (otherwise cloud-label)"
+                    },
+                    "prefer": {
+                        "type": "string",
+                        "description": "Preferred auth path: sso (browser/CLI login, default) | session (short-lived STS) | keys (long-lived, last resort)",
+                        "enum": ["sso", "session", "keys"]
+                    },
+                    "request_auth": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "If true (default), emit auth_required so TUI opens secure entry / user runs SSO; host auto-retries after auth."
+                    }
+                },
+                "required": ["cloud"]
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+        use oscar_identity::ProfileStore;
+
+        let cloud_s = args
+            .get("cloud")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let cloud = match Cloud::parse(cloud_s) {
+            Some(c) if matches!(c, Cloud::Aws | Cloud::Gcp | Cloud::Azure | Cloud::K8s) => c,
+            _ => {
+                return ToolResult::error(
+                    "cloud is required: aws | gcp | azure | k8s (not multi)",
+                );
+            }
+        };
+        let label = args
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default")
+            .trim();
+        let label = if label.is_empty() { "default" } else { label };
+        let account = args
+            .get("account")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pending")
+            .trim();
+        let account = if account.is_empty() {
+            "pending"
+        } else {
+            account
+        };
+        let region = args
+            .get("region")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let profile_id = args.get("profile_id").and_then(|v| v.as_str());
+        let prefer = args
+            .get("prefer")
+            .and_then(|v| v.as_str())
+            .and_then(AuthPrefer::parse)
+            .unwrap_or(AuthPrefer::BinarySso);
+        let request_auth = args
+            .get("request_auth")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let paths = match oscar_core::Paths::discover() {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(format!("config paths: {e}")),
+        };
+        if let Err(e) = paths.ensure() {
+            return ToolResult::error(format!("ensure config dir: {e}"));
+        }
+        let mut store = match ProfileStore::load(&paths) {
+            Ok(s) => s,
+            Err(e) => return ToolResult::error(format!("load profiles: {e}")),
+        };
+
+        let (profile, created) =
+            store.ensure_profile(cloud, label, account, region.clone(), profile_id);
+        if let Err(e) = store.save() {
+            return ToolResult::error(format!("save profiles.toml: {e}"));
+        }
+
+        let auth = auth_prepare_request(&profile, prefer);
+        let how: &str = match (cloud, prefer) {
+            (Cloud::Aws, AuthPrefer::BinarySso) => {
+                "Run AWS SSO / CLI login, or paste short-lived session keys in the TUI secure bar"
+            }
+            (Cloud::Aws, AuthPrefer::ShortLived) => {
+                "Store STS/session credentials with oscar auth aws-session / aws-assume-role (or secure bar)"
+            }
+            (Cloud::Aws, AuthPrefer::LongLived) => {
+                "Store long-lived access keys with oscar auth aws-keys (prefer short-lived when possible)"
+            }
+            (Cloud::Gcp, _) => "Run oscar auth gcloud-login (or store SA JSON via gcp-sa — not in chat)",
+            (Cloud::Azure, _) => "Run oscar auth az-login (or paste SP secrets in TUI secure bar)",
+            (Cloud::K8s, _) => "Select a working kubectl context; oscar uses binary session",
+            _ => "Follow hint_commands to authenticate",
+        };
+
+        let summary = if created {
+            format!(
+                "Created local profile `{}` ({cloud}, account={}) — {how}. Secrets are NOT stored yet.",
+                profile.id, profile.account_ref
+            )
+        } else {
+            format!(
+                "Updated/using local profile `{}` ({cloud}, account={}) — {how}",
+                profile.id, profile.account_ref
+            )
+        };
+
+        let data = json!({
+            "reload_profiles": true,
+            "created": created,
+            "profile": {
+                "id": profile.id,
+                "cloud": profile.cloud.to_string(),
+                "label": profile.label,
+                "account_ref": profile.account_ref,
+                "default_region": profile.default_region,
+                "secret_keyring_id": profile.secret_keyring_id,
+            },
+            "profiles_file": paths.profiles_file.display().to_string(),
+            "prefer": match prefer {
+                AuthPrefer::BinarySso => "sso",
+                AuthPrefer::ShortLived => "session",
+                AuthPrefer::LongLived => "keys",
+            },
+            "auth_model": {
+                "binary_session": "Detected logged-in aws/gcloud/az/kubectl on PATH — preferred, no secrets in oscar keychain",
+                "short_lived_keychain": "STS/session or temp keys under OS keychain namespace oscar/<profile_id>/*",
+                "long_lived_keychain": "Access keys / SA JSON in keychain — use only when SSO/session unavailable",
+                "never_in_chat": true,
+            },
+            "next_steps": auth.hint_commands,
+            "guidance": auth.guidance,
+            "cli_equivalent": format!(
+                "oscar profiles add --cloud {} --label {} --account {}{}",
+                cloud,
+                profile.label,
+                profile.account_ref,
+                region.as_ref().map(|r| format!(" --region {r}")).unwrap_or_default()
+            ),
+            "after_auth": [
+                "Type `retry` in chat if a tool was waiting, or re-ask the agent",
+                "oscar identities check",
+                "oscar auth aws-test --profile <id>  # AWS",
+            ],
+            "ui": "/identities · secure input bar on auth_required · never paste secrets into chat",
+        });
+
+        if request_auth {
+            // success path with auth_required so host opens secure/SSO UX but profile is already saved
+            let mut r = ToolResult::needs_auth(auth);
+            // Overlay rich data (keep auth_required)
+            if let Some(obj) = data.as_object() {
+                if let Some(map) = r.data.as_object_mut() {
+                    for (k, v) in obj {
+                        map.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            r.summary = summary;
+            // ok=false from needs_auth is correct — auth still needed
+            return r;
+        }
+
+        ToolResult::success(summary, data)
+    }
+}
+
+#[async_trait]
+impl Tool for SystemProfilesList {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "system.profiles.list".into(),
+            name: "List local oscar profiles".into(),
+            description: "List oscar cloud profile metadata from profiles.toml (ids, clouds, accounts, regions). No secrets. Use system.access.prepare to create; system.identities.list for live validity.".into(),
+            domain: ToolDomain::Meta,
+            clouds: vec![Cloud::Multi],
+            capability: Capability::Read,
+            tags: vec![
+                "profile".into(),
+                "profiles".into(),
+                "account".into(),
+                "list".into(),
+                "config".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "cloud": { "type": "string", "description": "Optional filter: aws|gcp|azure|k8s" }
+                }
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        let filter = args
+            .get("cloud")
+            .and_then(|v| v.as_str())
+            .and_then(Cloud::parse);
+        let rows: Vec<_> = ctx
+            .profiles
+            .list()
+            .iter()
+            .filter(|p| filter.map(|c| p.cloud == c).unwrap_or(true))
+            .map(|p| {
+                json!({
+                    "id": p.id,
+                    "cloud": p.cloud.to_string(),
+                    "label": p.label,
+                    "account_ref": p.account_ref,
+                    "default_region": p.default_region,
+                })
+            })
+            .collect();
+        ToolResult::success(
+            format!("{} profile(s)", rows.len()),
+            json!({
+                "profiles": rows,
+                "hint": "Create/sign-in: system.access.prepare with cloud (+ account/label). Live check: system.identities.list",
             }),
         )
     }

@@ -57,8 +57,10 @@ When reviewing security controls, policies, users, roles, identities, or securit
 ## Auth & secrets (critical)
 - LLM keys: OS keychain (not ambient env) unless custom `api_key_env`.
 - Cloud: keychain long-lived, short-lived STS/session, or detected binary sessions (`aws`/`gcloud`/`az`/`kubectl`).
+- **When the user asks to access / use / connect a cloud or account** (e.g. "use my AWS account", "GCP project X", "log into Azure"): call **`system.access.prepare`** first with `cloud` (+ `account` / `label` / `region` if known). That creates local profile metadata and returns sign-in steps (SSO or short-lived keys). Do **not** invent ad-hoc profile files.
+- Check what is already configured: `system.profiles.list` or `system.identities.list`.
 - On `auth_required`: surface `hint_commands` / operator steps; host pauses and auto-retries after secure entry or user `retry`. Never invent credentials.
-- Prefer short-lived role/session creds over long-lived keys when available.
+- Prefer short-lived role/session creds / SSO over long-lived keys when available.
 - **Never** request, echo, or store raw secrets in chat. Results may show `***REDACTED***`.
 
 ## Skills (steering outside this harness)

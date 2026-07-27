@@ -884,6 +884,20 @@ impl Agent {
                         }
                     }
 
+                    // system.access.prepare (etc.) may have written profiles.toml — reload in-session.
+                    if result
+                        .data
+                        .get("reload_profiles")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        if let Ok(paths) = oscar_core::Paths::discover() {
+                            if let Ok(store) = ProfileStore::load(&paths) {
+                                self.reload_profiles(Arc::new(store));
+                            }
+                        }
+                    }
+
                     if let Some(auth) = result.auth_required.clone() {
                         self.pending_retry = Some(PendingToolRetry {
                             tool_id: tool_id.clone(),

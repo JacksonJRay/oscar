@@ -472,8 +472,9 @@ pub fn resolve_azure_hints(profile: &Profile, binaries: &BinaryInventory) -> Res
     )
     .profile(profile.id.clone())
     .with_hints([
-        "az login".to_string(),
-        format!("oscar auth azure-sp --profile {}", profile.id),
+        "oscar auth az-login".to_string(),
+        format!("oscar auth az-login --tenant <tenant-id>  # profile {}", profile.id),
+        "az account show".to_string(),
     ]))
 }
 
