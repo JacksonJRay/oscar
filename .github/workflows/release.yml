@@ -213,7 +213,11 @@ jobs:
     name: publish GitHub Release
     needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
+    # Publish even if a non-Linux matrix leg fails (Linux is the primary distribution).
+    if: >-
+      always() &&
+      needs.build-linux.result == 'success' &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false))
     steps:
       - uses: actions/checkout@v4
 
@@ -227,7 +231,12 @@ jobs:
         run: |
           set -euo pipefail
           ls -laR dist
-          cat dist/SHA256SUMS-*.txt | sort > dist/SHA256SUMS
+          if compgen -G "dist/SHA256SUMS-*.txt" > /dev/null; then
+            cat dist/SHA256SUMS-*.txt | sort > dist/SHA256SUMS
+          else
+            echo "no checksum fragments found" >&2
+            exit 1
+          fi
           cat dist/SHA256SUMS
 
       - name: Extract changelog section
@@ -288,7 +297,7 @@ jobs:
           body_path: ${{ steps.notes.outputs.path }}
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
           files: |
             dist/oscar-*.tar.gz
             dist/oscar-*.zip

@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 /// Role of a binary for agent planning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -357,26 +359,75 @@ fn path_dirs() -> Vec<PathBuf> {
 }
 
 fn is_executable(path: &Path) -> bool {
-    fs::metadata(path)
-        .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
-        .unwrap_or(false)
+    #[cfg(unix)]
+    {
+        fs::metadata(path)
+            .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: presence as a file (or .exe sibling) is enough; no Unix mode bits.
+        path.is_file()
+            || path.with_extension("exe").is_file()
+            || path.with_extension("cmd").is_file()
+            || path.with_extension("bat").is_file()
+    }
+}
+
+/// Resolve `name` on PATH in a cross-platform way.
+fn which_on_path(name: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {name}"))
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        // Prefer `where.exe` (Windows); fall back to walking PATH.
+        if let Ok(o) = Command::new("where.exe").arg(name).output() {
+            if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+        for dir in path_dirs() {
+            for cand in [
+                dir.join(name),
+                dir.join(format!("{name}.exe")),
+                dir.join(format!("{name}.cmd")),
+                dir.join(format!("{name}.bat")),
+            ] {
+                if cand.is_file() {
+                    return Some(cand.display().to_string());
+                }
+            }
+        }
+        None
+    }
 }
 
 fn probe(name: &str, role: BinaryRole, agent_use: &str) -> BinaryInfo {
-    let path = Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {name}"))
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        });
+    let path = which_on_path(name);
 
     let present = path.is_some();
     let version_hint = if present {
