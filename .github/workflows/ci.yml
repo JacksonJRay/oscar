@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Library tests
+        run: cargo test -p oscar-core -p oscar-mode -p oscar-tools -p oscar-agent --lib --locked
+
+      - name: Build CLI (debug)
+        run: cargo build -p oscar-cli --locked
+
+      - name: CLI smoke
+        run: |
+          set -euo pipefail
+          BIN=./target/debug/oscar
+          "$BIN" --version
+          "$BIN" --help >/dev/null
+          "$BIN" tools list | head -5
+          "$BIN" tools catalog | head -5
+          "$BIN" mcp presets | head -5
+          "$BIN" inventory status || true

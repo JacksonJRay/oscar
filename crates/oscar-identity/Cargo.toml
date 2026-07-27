@@ -1,0 +1,15 @@
+[package]
+name = "oscar-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cloud profiles and OS keychain credentials for oscar"
+
+[dependencies]
+oscar-core.workspace = true
+keyring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true

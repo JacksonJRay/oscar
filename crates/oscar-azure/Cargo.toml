@@ -1,0 +1,14 @@
+[package]
+name = "oscar-azure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Azure DNS and Network Watcher tools for oscar"
+
+[dependencies]
+oscar-core.workspace = true
+oscar-identity.workspace = true
+oscar-tools.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["process"] }

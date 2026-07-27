@@ -1,0 +1,297 @@
+name: Release
+
+# Tagging: push an annotated tag vMAJOR.MINOR.PATCH (see docs/RELEASING.md).
+# Produces Linux + macOS tarballs on the GitHub Release for direct download.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build artifacts without creating/updating a GitHub Release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_latest: oscar-x86_64-unknown-linux-gnu.tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive_latest: oscar-aarch64-unknown-linux-gnu.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build -p oscar-cli --release --locked --target ${{ matrix.target }}
+
+      - name: Package tarball
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          if [[ ! "$VERSION" =~ ^v ]]; then
+            CARGO_V=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+            VERSION="v${CARGO_V}"
+          fi
+          BIN="target/${{ matrix.target }}/release/oscar"
+          test -x "$BIN"
+          STAGE=$(mktemp -d)
+          cp "$BIN" "$STAGE/oscar"
+          cp README.md LICENSE CHANGELOG.md "$STAGE/" 2>/dev/null || true
+          VER_TAR="oscar-${VERSION}-${{ matrix.target }}.tar.gz"
+          STABLE_TAR="${{ matrix.archive_latest }}"
+          tar -C "$STAGE" -czf "$VER_TAR" oscar README.md LICENSE CHANGELOG.md 2>/dev/null \
+            || tar -C "$STAGE" -czf "$VER_TAR" oscar
+          cp "$VER_TAR" "$STABLE_TAR"
+          sha256sum "$VER_TAR" "$STABLE_TAR" | tee SHA256SUMS-${{ matrix.target }}.txt
+          echo "ver_tar=$VER_TAR" >> "$GITHUB_OUTPUT"
+          echo "stable_tar=$STABLE_TAR" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: oscar-${{ matrix.target }}
+          path: |
+            ${{ steps.pack.outputs.ver_tar }}
+            ${{ steps.pack.outputs.stable_tar }}
+            SHA256SUMS-${{ matrix.target }}.txt
+          if-no-files-found: error
+
+  build-macos:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive_latest: oscar-aarch64-apple-darwin.tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive_latest: oscar-x86_64-apple-darwin.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build -p oscar-cli --release --locked --target ${{ matrix.target }}
+
+      - name: Package tarball
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          if [[ ! "$VERSION" =~ ^v ]]; then
+            CARGO_V=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+            VERSION="v${CARGO_V}"
+          fi
+          BIN="target/${{ matrix.target }}/release/oscar"
+          test -x "$BIN"
+          STAGE=$(mktemp -d)
+          cp "$BIN" "$STAGE/oscar"
+          cp README.md LICENSE CHANGELOG.md "$STAGE/" 2>/dev/null || true
+          VER_TAR="oscar-${VERSION}-${{ matrix.target }}.tar.gz"
+          STABLE_TAR="${{ matrix.archive_latest }}"
+          tar -C "$STAGE" -czf "$VER_TAR" oscar README.md LICENSE CHANGELOG.md 2>/dev/null \
+            || tar -C "$STAGE" -czf "$VER_TAR" oscar
+          cp "$VER_TAR" "$STABLE_TAR"
+          shasum -a 256 "$VER_TAR" "$STABLE_TAR" | tee SHA256SUMS-${{ matrix.target }}.txt
+          echo "ver_tar=$VER_TAR" >> "$GITHUB_OUTPUT"
+          echo "stable_tar=$STABLE_TAR" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: oscar-${{ matrix.target }}
+          path: |
+            ${{ steps.pack.outputs.ver_tar }}
+            ${{ steps.pack.outputs.stable_tar }}
+            SHA256SUMS-${{ matrix.target }}.txt
+          if-no-files-found: error
+
+  build-windows:
+    name: build x86_64-pc-windows-msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-pc-windows-msvc
+
+      - name: Build release binary
+        run: cargo build -p oscar-cli --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package zip
+        id: pack
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $VERSION = if ($env:GITHUB_REF_NAME -and $env:GITHUB_REF_NAME.StartsWith("v")) {
+            $env:GITHUB_REF_NAME
+          } else {
+            $v = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+            "v$v"
+          }
+          $BIN = "target/x86_64-pc-windows-msvc/release/oscar.exe"
+          if (-not (Test-Path $BIN)) { throw "missing $BIN" }
+          $STAGE = New-Item -ItemType Directory -Path ([System.IO.Path]::GetTempPath() + [System.Guid]::NewGuid().ToString())
+          Copy-Item $BIN "$STAGE/oscar.exe"
+          foreach ($f in @("README.md","LICENSE","CHANGELOG.md")) {
+            if (Test-Path $f) { Copy-Item $f $STAGE }
+          }
+          $VER_ZIP = "oscar-$VERSION-x86_64-pc-windows-msvc.zip"
+          $STABLE_ZIP = "oscar-x86_64-pc-windows-msvc.zip"
+          Compress-Archive -Path "$STAGE/*" -DestinationPath $VER_ZIP -Force
+          Copy-Item $VER_ZIP $STABLE_ZIP -Force
+          $h1 = (Get-FileHash $VER_ZIP -Algorithm SHA256).Hash.ToLower()
+          $h2 = (Get-FileHash $STABLE_ZIP -Algorithm SHA256).Hash.ToLower()
+          @"
+          $h1  $VER_ZIP
+          $h2  $STABLE_ZIP
+          "@ | Set-Content -Path SHA256SUMS-x86_64-pc-windows-msvc.txt
+          "ver_zip=$VER_ZIP" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "stable_zip=$STABLE_ZIP" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: oscar-x86_64-pc-windows-msvc
+          path: |
+            ${{ steps.pack.outputs.ver_zip }}
+            ${{ steps.pack.outputs.stable_zip }}
+            SHA256SUMS-x86_64-pc-windows-msvc.txt
+          if-no-files-found: error
+
+  publish:
+    name: publish GitHub Release
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Merge checksums
+        run: |
+          set -euo pipefail
+          ls -laR dist
+          cat dist/SHA256SUMS-*.txt | sort > dist/SHA256SUMS
+          cat dist/SHA256SUMS
+
+      - name: Extract changelog section
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          VER_NUM="${VERSION#v}"
+          BASE="${VER_NUM%%-*}"
+          OUT=release-notes.md
+          {
+            echo "## Downloads"
+            echo
+            echo "### Linux"
+            echo
+            echo "| Arch | Stable (latest) |"
+            echo "|------|-----------------|"
+            echo "| x86_64 | [oscar-x86_64-unknown-linux-gnu.tar.gz](https://github.com/${{ github.repository }}/releases/download/${VERSION}/oscar-x86_64-unknown-linux-gnu.tar.gz) |"
+            echo "| aarch64 | [oscar-aarch64-unknown-linux-gnu.tar.gz](https://github.com/${{ github.repository }}/releases/download/${VERSION}/oscar-aarch64-unknown-linux-gnu.tar.gz) |"
+            echo
+            echo "### macOS"
+            echo
+            echo "| Arch | Stable (latest) |"
+            echo "|------|-----------------|"
+            echo "| Apple Silicon | [oscar-aarch64-apple-darwin.tar.gz](https://github.com/${{ github.repository }}/releases/download/${VERSION}/oscar-aarch64-apple-darwin.tar.gz) |"
+            echo "| Intel | [oscar-x86_64-apple-darwin.tar.gz](https://github.com/${{ github.repository }}/releases/download/${VERSION}/oscar-x86_64-apple-darwin.tar.gz) |"
+            echo
+            echo "### Windows"
+            echo
+            echo "| Arch | Stable (latest) |"
+            echo "|------|-----------------|"
+            echo "| x86_64 | [oscar-x86_64-pc-windows-msvc.zip](https://github.com/${{ github.repository }}/releases/download/${VERSION}/oscar-x86_64-pc-windows-msvc.zip) |"
+            echo
+            echo "Checksums: [SHA256SUMS](https://github.com/${{ github.repository }}/releases/download/${VERSION}/SHA256SUMS)"
+            echo
+            echo "Homebrew: [Formula/oscar.rb](https://github.com/${{ github.repository }}/blob/main/Formula/oscar.rb)"
+            echo
+            echo "---"
+            echo
+          } > "$OUT"
+
+          if [[ -f CHANGELOG.md ]]; then
+            awk -v ver="$BASE" '
+              BEGIN { p=0 }
+              $0 ~ "^## \\[" ver "\\]" { p=1; print; next }
+              p && $0 ~ /^## \[/ { exit }
+              p { print }
+            ' CHANGELOG.md >> "$OUT" || true
+          fi
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: oscar ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.path }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/oscar-*.tar.gz
+            dist/oscar-*.zip
+            dist/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

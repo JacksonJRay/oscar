@@ -1,0 +1,22 @@
+[package]
+name = "oscar-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Agent loop, system prompt, and context manager for oscar"
+
+[dependencies]
+oscar-core.workspace = true
+oscar-identity.workspace = true
+oscar-providers.workspace = true
+oscar-tools.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true

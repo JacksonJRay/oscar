@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oscar-core",
+    "crates/oscar-mode",
+    "crates/oscar-identity",
+    "crates/oscar-providers",
+    "crates/oscar-tools",
+    "crates/oscar-mcp",
+    "crates/oscar-agent",
+    "crates/oscar-tui",
+    "crates/oscar-aws",
+    "crates/oscar-gcp",
+    "crates/oscar-azure",
+    "crates/oscar-k8s",
+    "crates/oscar-cli",
+]
+
+[workspace.package]
+version = "0.1.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/JacksonJRay/oscar"
+authors = ["JacksonJRay"]
+
+[workspace.dependencies]
+oscar-core = { path = "crates/oscar-core" }
+oscar-mode = { path = "crates/oscar-mode" }
+oscar-identity = { path = "crates/oscar-identity" }
+oscar-providers = { path = "crates/oscar-providers" }
+oscar-tools = { path = "crates/oscar-tools" }
+oscar-mcp = { path = "crates/oscar-mcp" }
+oscar-agent = { path = "crates/oscar-agent" }
+oscar-tui = { path = "crates/oscar-tui" }
+oscar-aws = { path = "crates/oscar-aws" }
+oscar-gcp = { path = "crates/oscar-gcp" }
+oscar-azure = { path = "crates/oscar-azure" }
+oscar-k8s = { path = "crates/oscar-k8s" }
+
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.28"
+dirs = "6"
+futures = "0.3"
+keyring = "3"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+bytes = "1"
+eventsource-stream = "0.2"
+pin-project-lite = "0.2"
+async-stream = "0.3"
+toml = { version = "0.8", features = ["display"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

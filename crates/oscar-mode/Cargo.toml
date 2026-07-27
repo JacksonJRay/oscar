@@ -1,0 +1,9 @@
+[package]
+name = "oscar-mode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Execution mode enforcement for oscar"
+
+[dependencies]
+oscar-core.workspace = true

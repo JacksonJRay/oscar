@@ -1,0 +1,17 @@
+# Example third-party plugin tool.
+# Copy to ~/.config/oscar/plugins/example-echo.toml (or .oscar/plugins/ in a project).
+id = "plugin.example.echo"
+name = "Example echo plugin"
+description = "Demo plugin: echoes a message via printf. Discover with tools_search \"plugin\"."
+domain = "meta"
+clouds = ["multi"]
+capability = "read"
+tags = ["example", "demo"]
+command = "printf"
+args = ["%s\n", "{{message}}"]
+timeout_sec = 10
+
+[input_schema]
+type = "object"
+properties = { message = { type = "string", description = "Text to echo" } }
+required = ["message"]

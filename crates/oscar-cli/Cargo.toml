@@ -1,0 +1,33 @@
+[package]
+name = "oscar-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "oscar CLI binary — multi-cloud native dredger"
+default-run = "oscar"
+
+[[bin]]
+name = "oscar"
+path = "src/main.rs"
+
+[dependencies]
+oscar-core.workspace = true
+oscar-mode.workspace = true
+oscar-identity.workspace = true
+oscar-providers.workspace = true
+oscar-tools.workspace = true
+oscar-mcp.workspace = true
+oscar-agent.workspace = true
+oscar-tui.workspace = true
+oscar-aws.workspace = true
+oscar-gcp.workspace = true
+oscar-azure.workspace = true
+oscar-k8s.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
