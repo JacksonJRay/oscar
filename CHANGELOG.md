@@ -16,6 +16,8 @@ Release artifacts (Linux) are attached to GitHub Releases:
 
 - **Settings → Raw config:** scrollable effective `config.toml` TOML viewer (path + disk/in-memory status; API keys never appear — keychain only)
 - **Controllable chat pane + clipboard (Grok Build–style):** Tab focuses scrollback vs prompt; ↑↓ select lines; Shift+↑↓ extend highlight; `y` / Enter / Ctrl+Y copy; Ctrl+V paste; mouse click/drag select + wheel scroll; `/copy` [n|path]; OSC 52 + native clipboard + `~/.config/oscar/last-copy.txt` backup
+- **Grok primary + OAuth:** `oscar auth login` / `--device`; tokens in `auth.json` + keychain; docs in `docs/AUTH-GROK.md`
+- **Multi-provider models:** `[providers.*]` slots keep several providers loaded; **`/model`** lists and switches across all loaded providers (`/model 3`, `/model openai/gpt-4o`)
 
 ### Planned
 

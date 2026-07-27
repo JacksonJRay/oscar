@@ -8,12 +8,21 @@
 use oscar_core::config::{OscarConfig, ProviderSettings};
 use oscar_identity::load_provider_api_key;
 
-/// Built-in providers shown in the picker.
+/// Built-in providers shown in the picker (Grok primary).
 pub const BUILTIN_PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta {
+        id: "grok",
+        name: "Grok (xAI) ★ primary",
+        auth_hint: "oscar auth login (OAuth) · or console.x.ai API key",
+        console_url: "https://console.x.ai/team/default/api-keys",
+        default_base: "https://api.x.ai/v1",
+        default_model: "grok-4",
+        needs_account: true,
+    },
+    ProviderMeta {
         id: "xai",
-        name: "xAI (Grok)",
-        auth_hint: "Account → console.x.ai → API Keys → paste key",
+        name: "xAI (alias of Grok)",
+        auth_hint: "Same as Grok — OAuth or API key (shared keychain)",
         console_url: "https://console.x.ai/team/default/api-keys",
         default_base: "https://api.x.ai/v1",
         default_model: "grok-4",
@@ -34,7 +43,7 @@ pub const BUILTIN_PROVIDERS: &[ProviderMeta] = &[
         auth_hint: "console.anthropic.com → API keys → paste key",
         console_url: "https://console.anthropic.com/settings/keys",
         default_base: "https://api.anthropic.com",
-        default_model: "claude-sonnet-4-20250514",
+        default_model: "claude-sonnet-4-5",
         needs_account: false,
     },
     ProviderMeta {
@@ -382,17 +391,19 @@ impl ProviderPane {
                 if row.id == "__add_custom__" {
                     return;
                 }
-                self.config.provider.id = row.id.clone();
-                if self.config.provider.model.is_none() {
-                    self.config.provider.model = Some(row.default_model.clone());
-                }
-                if self.config.provider.base_url.is_none() && !row.is_builtin {
-                    // keep
-                } else if row.is_builtin && self.config.provider.base_url.is_none() {
-                    // leave default None = built-in URL
-                }
+                let model = self
+                    .config
+                    .provider
+                    .model
+                    .clone()
+                    .or_else(|| Some(row.default_model.clone()));
+                self.config.activate_provider(&row.id, model);
                 self.dirty = true;
-                self.flash = Some(format!("Default provider → `{}`", row.id));
+                self.flash = Some(format!(
+                    "Active → `{}` / {} (other providers stay loaded · /model)",
+                    row.id,
+                    self.config.provider.model.as_deref().unwrap_or("—")
+                ));
                 self.pending = Some(ProviderPaneAction::ConfigChanged);
             }
             ProviderAction::OpenConsole => {

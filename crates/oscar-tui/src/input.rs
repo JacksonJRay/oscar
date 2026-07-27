@@ -10,7 +10,8 @@ pub const IDLE_HINT_INTERVAL: Duration = Duration::from_millis(3800);
 /// Cycling help tooltips shown in the input bar when empty (chat, normal mode).
 pub const IDLE_INPUT_HINTS: &[&str] = &[
     "Ask about multi-cloud DNS, network paths, or k8s…",
-    "Type /help · /provider for LLM setup · /settings (Ctrl+,)",
+    "Type /help · /model to switch models · /provider · /settings (Ctrl+,)",
+    "Grok primary: oscar auth login (OAuth) · multi-provider: load keys then /model",
     "Tab: focus chat to select/copy · y or Ctrl+Y copy · Ctrl+V paste",
     "Input bar: Ctrl+A start · Ctrl+E end · Ctrl+U clear · Ctrl+V paste",
     "Discover tools via Code Mode: agent uses tools_search then tools_execute",

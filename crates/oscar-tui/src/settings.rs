@@ -31,6 +31,7 @@ impl ProviderAuthMode {
     pub fn for_provider(id: &str) -> Self {
         match id {
             "openai" | "anthropic" | "claude" => Self::ApiKey,
+            // Grok: prefer OAuth (`oscar auth login`); key paste still available.
             "xai" | "grok" | "opencode-zen" | "zen" | "opencode-go" | "go" => Self::AccountSignIn,
             _ => Self::ApiKey,
         }
@@ -39,7 +40,7 @@ impl ProviderAuthMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::ApiKey => "API key",
-            Self::AccountSignIn => "Account sign-in + key",
+            Self::AccountSignIn => "OAuth / account + key",
         }
     }
 }
@@ -47,11 +48,11 @@ impl ProviderAuthMode {
 /// Browser page to open for account sign-in / key creation.
 pub fn provider_auth_url(id: &str) -> &'static str {
     match id {
-        "xai" | "grok" => "https://console.x.ai/",
+        "xai" | "grok" => "https://accounts.x.ai/sign-in",
         "opencode-zen" | "zen" | "opencode-go" | "go" => "https://opencode.ai/auth",
         "openai" => "https://platform.openai.com/api-keys",
         "anthropic" | "claude" => "https://console.anthropic.com/settings/keys",
-        _ => "https://console.x.ai/",
+        _ => "https://accounts.x.ai/sign-in",
     }
 }
 
@@ -795,7 +796,7 @@ impl SettingsPane {
     }
 
     fn items_provider(&self) -> Vec<SettingsItem> {
-        let providers = ["xai", "openai", "anthropic", "opencode-zen", "opencode-go"];
+        let providers = ["grok", "xai", "openai", "anthropic", "opencode-zen", "opencode-go"];
         let idx = providers
             .iter()
             .position(|p| *p == self.config.provider.id)

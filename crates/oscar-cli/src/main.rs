@@ -5,11 +5,15 @@ use oscar_core::config::{InstallBinariesPolicy, OscarConfig, Paths, ToolsSetting
 use oscar_core::events::AgentEvent;
 use oscar_core::{ExecutionMode, ThinkingConfig};
 use oscar_identity::{
-    assume_role_into_profile, critical_csp_binaries, load_provider_api_key, plan_install,
+    assume_role_into_profile, critical_csp_binaries, plan_install,
     run_install_commands, store_aws_long_lived, store_aws_short_lived, store_provider_api_key,
     validate_aws, BinaryInventory, KeychainStore, Profile, ProfileStore,
 };
-use oscar_providers::{create_provider, inject_headless_llm_key, list_provider_ids};
+use oscar_providers::{
+    create_provider, create_provider_async, format_model_list, inject_headless_llm_key,
+    list_loaded_providers, list_provider_ids, provider_has_credentials, resolve_model_selection,
+    run_browser_login, run_device_login, xai_oauth_status_line, clear_xai_oauth,
+};
 use oscar_tools::sync::{DnsInventorySource, NetworkInventorySource};
 use oscar_aws::DnsResolverInventorySource;
 use oscar_azure::AzureDnsResolverInventorySource;
@@ -602,10 +606,26 @@ enum SettingsCmd {
 
 #[derive(Subcommand, Debug)]
 enum AuthCmd {
+    /// Grok / xAI OAuth login (browser PKCE; primary auth for Grok)
+    #[command(long_about = "Sign in to Grok (xAI) via SpaceXAI OAuth at auth.x.ai.\n\n\
+Default: open browser (authorization code + PKCE).\n\
+--device: device-code flow for SSH/headless (print URL + code).\n\n\
+Tokens: ~/.config/oscar/auth.json (0600) + OS keychain oscar/provider/xai.\n\
+Requires SuperGrok / eligible subscription for OAuth API access; otherwise use provider-key.")]
+    Login {
+        /// Device-code flow (no localhost callback; good for SSH)
+        #[arg(long)]
+        device: bool,
+    },
+    /// Clear Grok/xAI OAuth session
+    Logout,
+    /// Show Grok OAuth + loaded provider credential status
+    #[command(name = "status")]
+    AuthStatus,
     /// Store LLM provider API key in OS keychain (preferred; not env)
     #[command(long_about = "Writes provider API key to OS keychain under oscar/provider/<id>. Prefer --key-file. Key is never printed. Built-in providers will not fall back to XAI_API_KEY/OPENAI_API_KEY unless config sets provider.api_key_env (custom providers).")]
     ProviderKey {
-        #[arg(long, long_help = "Provider id: xai | openai | anthropic | opencode-zen | opencode-go | custom")]
+        #[arg(long, long_help = "Provider id: grok | xai | openai | anthropic | opencode-zen | opencode-go | custom")]
         provider: String,
         #[arg(long, long_help = "API key string (avoid if possible—prefer --key-file)")]
         key: Option<String>,
@@ -1008,33 +1028,50 @@ async fn main() -> Result<()> {
         Some(Commands::Provider { action }) => {
             match action.unwrap_or(ProviderCmd::List) {
                 ProviderCmd::List => {
-                    println!("# * = configured default  | keys: oscar auth provider-key (not ambient env)");
+                    println!("# * = active  | multi-provider: auth several, switch with /model");
+                    println!("{}", xai_oauth_status_line(&paths));
                     for id in list_provider_ids() {
                         let mark = if *id == cfg.provider.id { "*" } else { " " };
-                        let key_state = match load_provider_api_key(id) {
-                            Ok(Some(_)) => "keychain=yes",
-                            Ok(None) => "keychain=no",
-                            Err(_) => "keychain=?",
+                        let ready = if provider_has_credentials(&paths, id) {
+                            "ready"
+                        } else {
+                            "no-creds"
                         };
-                        println!("{mark} {id}\t{key_state}");
+                        let slot = cfg.providers.get(*id).and_then(|s| s.model.clone());
+                        println!(
+                            "{mark} {id:<14}  {ready:<8}  model={}",
+                            slot.as_deref()
+                                .or(if *id == cfg.provider.id {
+                                    cfg.provider.model.as_deref()
+                                } else {
+                                    None
+                                })
+                                .unwrap_or("—")
+                        );
                     }
-                    println!("custom: set provider id + base_url in config; optional api_key_env for custom env-only keys");
+                    println!("\nloaded slots: {}", cfg.providers.len());
+                    println!("Grok OAuth: oscar auth login   |  API key: oscar auth provider-key --provider grok");
+                    println!("switch: /model list  ·  oscar provider set grok");
                 }
                 ProviderCmd::Set { id } => {
-                    // Allow custom ids; built-ins validated loosely
-                    cfg.provider.id = id;
+                    cfg.activate_provider(&id, None);
+                    if cfg.provider.model.is_none() {
+                        cfg.provider.model =
+                            Some(oscar_providers::default_model_for(&cfg.provider.id));
+                    }
                     cfg.save(&paths)?;
                     println!(
-                        "provider set to {} (store key: oscar auth provider-key --provider {} --key-file …)",
-                        cfg.provider.id, cfg.provider.id
+                        "provider set to {} model={}  (other loaded providers kept; /model to switch)",
+                        cfg.provider.id,
+                        cfg.provider.model.as_deref().unwrap_or("—")
                     );
                 }
                 ProviderCmd::Status => {
                     let id = &cfg.provider.id;
-                    let key_state = match load_provider_api_key(id) {
-                        Ok(Some(_)) => "present (value hidden)".to_string(),
-                        Ok(None) => "missing".to_string(),
-                        Err(e) => format!("error: {e}"),
+                    let key_state = if provider_has_credentials(&paths, id) {
+                        "ready".to_string()
+                    } else {
+                        "missing".to_string()
                     };
                     println!("provider={id}");
                     println!("model={}", cfg.provider.model.as_deref().unwrap_or("(default)"));
@@ -1044,9 +1081,11 @@ async fn main() -> Result<()> {
                         cfg.provider
                             .api_key_env
                             .as_deref()
-                            .unwrap_or("(none — keychain only for built-ins)")
+                            .unwrap_or("(none — keychain/OAuth for built-ins)")
                     );
-                    println!("keychain_key={key_state}");
+                    println!("credentials={key_state}");
+                    println!("{}", xai_oauth_status_line(&paths));
+                    println!("loaded_providers={}", list_loaded_providers(&cfg, &paths).len());
                     println!("note=raw keys are never printed or sent to the agent transcript");
                 }
             }
@@ -1388,16 +1427,76 @@ async fn run_auth(action: AuthCmd, paths: &Paths) -> Result<()> {
         AuthCmd::Policy => {
             println!(
                 r#"oscar auth policy:
-- LLM keys: OS keychain via `oscar auth provider-key` or headless `--llm-api-key` (stores into keychain).
-  Default env vars (XAI_API_KEY, OPENAI_API_KEY, …) are NOT used unless config sets provider.api_key_env (custom providers only).
-- CSP: keychain long-lived keys, short-lived STS/session tokens, OR detected binary sessions (aws/gcloud/az/kubectl already logged in).
-- Prefer short-lived role creds: `oscar auth aws-assume-role` / `oscar auth aws-session`.
+- Grok (primary): `oscar auth login` (OAuth browser) or `oscar auth login --device` (SSH).
+  Fallback API key: `oscar auth provider-key --provider grok --key-file …`
+- Other LLMs: OS keychain via `oscar auth provider-key` or headless `--llm-api-key`.
+  Default env vars (XAI_API_KEY, …) are NOT used unless config sets provider.api_key_env.
+- Multi-provider: auth several providers; switch with `/model` without losing others.
+- CSP: keychain long-lived keys, short-lived STS/session tokens, OR binary sessions (aws/gcloud/az).
 - Detected binaries: `oscar binaries`
 "#
             );
             let inv = BinaryInventory::detect();
             println!("{}", inv.agent_summary());
-            let _ = paths;
+            println!("{}", xai_oauth_status_line(paths));
+            Ok(())
+        }
+        AuthCmd::Login { device } => {
+            let result = if device {
+                run_device_login(paths).await
+            } else {
+                run_browser_login(paths).await
+            };
+            match result {
+                Ok(session) => {
+                    // Ensure Grok is a loaded provider slot
+                    let mut cfg = OscarConfig::load(paths).unwrap_or_default();
+                    if cfg.provider.id.is_empty()
+                        || !provider_has_credentials(paths, &cfg.provider.id)
+                    {
+                        cfg.activate_provider("grok", Some("grok-4".into()));
+                    } else {
+                        cfg.sync_active_provider_slot();
+                        // Always ensure grok slot exists when OAuth succeeds
+                        cfg.providers.entry("grok".into()).or_insert_with(|| {
+                            oscar_core::config::ProviderSlot {
+                                model: Some("grok-4".into()),
+                                ..Default::default()
+                            }
+                        });
+                        cfg.providers.entry("xai".into()).or_insert_with(|| {
+                            oscar_core::config::ProviderSlot {
+                                model: Some("grok-4".into()),
+                                ..Default::default()
+                            }
+                        });
+                    }
+                    let _ = cfg.save(paths);
+                    let _ = session;
+                    Ok(())
+                }
+                Err(e) => Err(anyhow::anyhow!(e)),
+            }
+        }
+        AuthCmd::Logout => {
+            clear_xai_oauth(paths).map_err(|e| anyhow::anyhow!(e))?;
+            println!("Grok/xAI OAuth session cleared (keychain API keys left intact)");
+            Ok(())
+        }
+        AuthCmd::AuthStatus => {
+            println!("{}", xai_oauth_status_line(paths));
+            let cfg = OscarConfig::load(paths).unwrap_or_default();
+            println!("active provider={} model={}", cfg.provider.id, cfg.provider.model.as_deref().unwrap_or("—"));
+            println!("# loaded providers");
+            for p in list_loaded_providers(&cfg, paths) {
+                println!(
+                    "  {} {}  creds={}  model={}",
+                    if p.is_active { "*" } else { " " },
+                    p.id,
+                    p.has_credentials,
+                    p.model.as_deref().unwrap_or("—")
+                );
+            }
             Ok(())
         }
         AuthCmd::ProviderKey {
@@ -1411,7 +1510,20 @@ async fn run_auth(action: AuthCmd, paths: &Paths) -> Result<()> {
                 key.ok_or_else(|| anyhow::anyhow!("provide --key or --key-file"))?
             };
             store_provider_api_key(&provider, &key)?;
-            println!("stored LLM API key for provider `{provider}` in OS keychain");
+            // Keep multi-provider slot so /model can switch back
+            let mut cfg = OscarConfig::load(paths).unwrap_or_default();
+            cfg.providers
+                .entry(provider.clone())
+                .or_insert_with(|| oscar_core::config::ProviderSlot {
+                    model: cfg.provider.model.clone(),
+                    ..Default::default()
+                });
+            if provider == "grok" || provider == "xai" {
+                let _ = store_provider_api_key("xai", &key);
+                let _ = store_provider_api_key("grok", &key);
+            }
+            let _ = cfg.save(paths);
+            println!("stored LLM API key for provider `{provider}` in OS keychain (slot loaded)");
             Ok(())
         }
         AuthCmd::AwsKeys {
@@ -2093,7 +2205,9 @@ fn json_obj(pairs: impl IntoIterator<Item = (&'static str, Option<serde_json::Va
 async fn build_agent(cfg: &OscarConfig, paths: &Paths) -> Result<Agent> {
     let profiles = Arc::new(ProfileStore::load(paths)?);
     let tools = Arc::new(build_registry_with_mcp(cfg).await);
-    let provider = create_provider(&cfg.provider).map_err(|e| anyhow::anyhow!(e))?;
+    let provider = create_provider_async(&cfg.provider, paths)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
     let model = cfg
         .provider
         .model
@@ -3912,6 +4026,133 @@ fn run_sessions_compact(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
+async fn handle_model_slash(
+    user: &str,
+    agent: &mut Option<Agent>,
+    cfg: &mut OscarConfig,
+    paths: &Paths,
+    tx: &mpsc::Sender<AgentEvent>,
+) {
+    let rest = user
+        .trim()
+        .trim_start_matches("/models")
+        .trim_start_matches("/model")
+        .trim();
+
+    // list / bare
+    if rest.is_empty()
+        || rest == "list"
+        || rest == "ls"
+        || rest == "show"
+        || rest == "status"
+    {
+        let text = format_model_list(cfg, paths);
+        let _ = tx
+            .send(AgentEvent::ContentDelta {
+                text: format!("\n{text}\n"),
+            })
+            .await;
+        let _ = tx.send(AgentEvent::Done { usage: None }).await;
+        return;
+    }
+
+    if rest == "help" || rest == "?" {
+        let _ = tx
+            .send(AgentEvent::ContentDelta {
+                text: "\
+# /model — multi-provider model switcher
+/model                list loaded providers + models
+/model list
+/model 3              pick by number from the list
+/model grok-4         model id (prefers active provider, then any loaded)
+/model openai/gpt-4o  explicit provider/model
+/model openai gpt-4o  same
+
+Load more providers (they stay loaded while you switch):
+  oscar auth login                         # Grok OAuth (primary)
+  oscar auth provider-key --provider openai --key-file …
+  /provider                                # TUI setup
+
+Active provider is saved; others remain in [providers.*] slots.
+"
+                .into(),
+            })
+            .await;
+        let _ = tx.send(AgentEvent::Done { usage: None }).await;
+        return;
+    }
+
+    match resolve_model_selection(cfg, paths, rest) {
+        Ok((provider_id, model_id)) => {
+            let prev = format!(
+                "{}/{}",
+                cfg.provider.id,
+                cfg.provider.model.as_deref().unwrap_or("—")
+            );
+            cfg.activate_provider(&provider_id, Some(model_id.clone()));
+            if let Err(e) = cfg.save(paths) {
+                let _ = tx
+                    .send(AgentEvent::Error {
+                        message: format!("failed to save config: {e}"),
+                    })
+                    .await;
+                let _ = tx.send(AgentEvent::Done { usage: None }).await;
+                return;
+            }
+            // Rebuild agent on new provider/model (preserve history)
+            let pending = agent.as_ref().and_then(|a| a.pending_retry.clone());
+            let pending_install = agent.as_ref().and_then(|a| a.pending_install.clone());
+            let old_msgs = agent.as_ref().map(|a| a.session.messages.clone());
+            let old_id = agent.as_ref().map(|a| a.session.id.clone());
+            let old_title = agent.as_ref().map(|a| a.session.title.clone());
+            let old_skills = agent.as_ref().map(|a| a.active_skills.clone());
+            match build_agent(cfg, paths).await {
+                Ok(mut a) => {
+                    a.pending_retry = pending;
+                    a.pending_install = pending_install;
+                    if let Some(msgs) = old_msgs {
+                        a.session.messages = msgs;
+                    }
+                    if let Some(id) = old_id {
+                        a.session.id = id;
+                    }
+                    if let Some(t) = old_title {
+                        a.session.title = t;
+                    }
+                    if let Some(sk) = old_skills {
+                        a.active_skills = sk;
+                    }
+                    a.refresh_system();
+                    *agent = Some(a);
+                    let _ = tx
+                        .send(AgentEvent::ContentDelta {
+                            text: format!(
+                                "\n[model] {prev} → {}/{}  (loaded providers kept; /model list)\n",
+                                cfg.provider.id, model_id
+                            ),
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(AgentEvent::Error {
+                            message: format!(
+                                "switched config to {}/{} but agent rebuild failed: {e}\n\
+                                 Auth: oscar auth login  or  oscar auth provider-key --provider {provider_id}",
+                                cfg.provider.id, model_id
+                            ),
+                        })
+                        .await;
+                }
+            }
+        }
+        Err(e) => {
+            let _ = tx.send(AgentEvent::Error { message: e }).await;
+        }
+    }
+    let _ = tx.send(AgentEvent::Done { usage: None }).await;
+}
+
 async fn handle_slash(
     user: &str,
     agent: &mut Option<Agent>,
@@ -4374,12 +4615,18 @@ Mount: tools_search → tools_execute mcp.<server>.<tool>
             }
             let _ = tx.send(AgentEvent::Done { usage: None }).await;
         }
+        Some("/model") | Some("/models") => {
+            handle_model_slash(user, agent, cfg, paths, tx).await;
+        }
         Some("/help") => {
             let _ = tx
                 .send(AgentEvent::ContentDelta {
                     text: "\
 # slash commands
-/settings [show|disable-cloud|…]   Ctrl+,
+/model [list|N|name|provider/model]   switch model across loaded providers
+/models                               same as /model list
+/settings [show|…]   Ctrl+,
+/provider            provider setup / Grok OAuth
 /identities   Ctrl+I
 /skills  /skill <name>
 /mcp list|enable|disable
@@ -4388,11 +4635,13 @@ Mount: tools_search → tools_execute mcp.<server>.<tool>
 /history  /sessions     # list saved chats
 /resume <id>            # load a saved chat
 /new                    # start fresh chat (auto-saves history)
+/copy [N|path]          copy assistant reply
 /quit
 approve install | deny install
 
+Multi-provider: oscar auth login (Grok) + provider-key for others; /model switches without unloading.
 Sessions auto-save to ~/.config/oscar/sessions/ after each turn.
-CLI: oscar sessions list|show|delete|resume|new
+CLI: oscar sessions list|show|delete|resume|new · oscar auth login
 "
                     .into(),
                 })

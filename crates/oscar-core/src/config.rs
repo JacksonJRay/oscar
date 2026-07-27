@@ -17,6 +17,8 @@ pub struct Paths {
     pub logs_dir: PathBuf,
     /// MCP OAuth tokens (owner-only 0600), never chat.
     pub mcp_credentials_file: PathBuf,
+    /// LLM provider OAuth sessions (Grok/xAI, etc.) — owner-only 0600, never chat.
+    pub auth_file: PathBuf,
 }
 
 impl Paths {
@@ -31,6 +33,7 @@ impl Paths {
             artifacts_dir: config_dir.join("artifacts"),
             logs_dir: config_dir.join("logs"),
             mcp_credentials_file: config_dir.join("mcp_credentials.json"),
+            auth_file: config_dir.join("auth.json"),
             config_dir,
         };
         // Best-effort one-time import from the pre-rebrand config dir if oscar is empty.
@@ -98,8 +101,14 @@ fn copy_dir_contents(src: &std::path::Path, dst: &std::path::Path) -> OscarResul
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OscarConfig {
+    /// Active LLM provider + model for the agent.
     #[serde(default)]
     pub provider: ProviderSettings,
+    /// Multiple **loaded** provider slots (credentials + preferred model per provider).
+    /// Keys are provider ids (`xai`, `grok`, `openai`, …). Active selection is `provider`.
+    /// Use `/model` or `/provider` to switch without losing other loaded configs.
+    #[serde(default)]
+    pub providers: std::collections::BTreeMap<String, ProviderSlot>,
     #[serde(default)]
     pub mode: ExecutionMode,
     #[serde(default)]
@@ -123,6 +132,7 @@ impl Default for OscarConfig {
     fn default() -> Self {
         Self {
             provider: ProviderSettings::default(),
+            providers: std::collections::BTreeMap::new(),
             mode: ExecutionMode::ReadOnly,
             thinking: ThinkingConfig::Off,
             context: ContextSettings::default(),
@@ -270,7 +280,7 @@ impl ToolsSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderSettings {
-    /// Provider id: xai | anthropic | openai | opencode-zen | opencode-go
+    /// Provider id: grok | xai | anthropic | openai | opencode-zen | opencode-go | custom
     #[serde(default = "default_provider")]
     pub id: String,
     #[serde(default)]
@@ -281,18 +291,67 @@ pub struct ProviderSettings {
     pub base_url: Option<String>,
 }
 
+/// Per-provider saved slot so multiple providers can stay loaded at once.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderSlot {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// User-facing label override (optional).
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
 fn default_provider() -> String {
-    "xai".into()
+    // Grok (xAI) is the primary default provider.
+    "grok".into()
 }
 
 impl Default for ProviderSettings {
     fn default() -> Self {
         Self {
             id: default_provider(),
-            model: None,
+            model: Some("grok-4".into()),
             api_key_env: None,
             base_url: None,
         }
+    }
+}
+
+impl OscarConfig {
+    /// Remember the active provider in `providers` so multi-provider load persists.
+    pub fn sync_active_provider_slot(&mut self) {
+        let id = self.provider.id.clone();
+        if id.is_empty() {
+            return;
+        }
+        let slot = ProviderSlot {
+            model: self.provider.model.clone(),
+            base_url: self.provider.base_url.clone(),
+            api_key_env: self.provider.api_key_env.clone(),
+            label: self.providers.get(&id).and_then(|s| s.label.clone()),
+        };
+        self.providers.insert(id, slot);
+    }
+
+    /// Activate a loaded provider id (or new id) and optional model; updates `providers` map.
+    pub fn activate_provider(&mut self, provider_id: &str, model: Option<String>) {
+        // Prefer saved slot settings when switching back.
+        if let Some(slot) = self.providers.get(provider_id).cloned() {
+            self.provider.id = provider_id.to_string();
+            self.provider.model = model.or(slot.model);
+            self.provider.base_url = slot.base_url;
+            self.provider.api_key_env = slot.api_key_env;
+        } else {
+            self.provider.id = provider_id.to_string();
+            if let Some(m) = model {
+                self.provider.model = Some(m);
+            }
+        }
+        self.sync_active_provider_slot();
     }
 }
 

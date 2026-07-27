@@ -369,6 +369,7 @@ mod tests {
             artifacts_dir: dir.join("artifacts"),
             logs_dir: dir.join("logs"),
             mcp_credentials_file: dir.join("mcp_credentials.json"),
+            auth_file: dir.join("auth.json"),
         }
     }
 

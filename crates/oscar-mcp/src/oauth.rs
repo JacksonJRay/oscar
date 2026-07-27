@@ -593,6 +593,7 @@ mod tests {
             artifacts_dir: tmp.path().join("artifacts"),
             logs_dir: tmp.path().join("logs"),
             mcp_credentials_file: tmp.path().join("mcp_credentials.json"),
+            auth_file: tmp.path().join("auth.json"),
         };
         set_access_token(&paths, "linear", "tok-abc", None, Some(3600), None).unwrap();
         assert_eq!(get_access_token(&paths, "linear").as_deref(), Some("tok-abc"));

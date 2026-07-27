@@ -54,9 +54,11 @@ Full prerequisites, first-run auth, MCP presets, and packaging notes: [docs/INST
 ```bash
 oscar --help
 oscar tools catalog                    # Code Mode docs the agent receives
-oscar provider list | status | set xai
+oscar provider list | status | set grok
+oscar auth login                       # Grok OAuth (browser) — primary
+oscar auth login --device              # Grok OAuth for SSH / headless
 oscar auth policy
-oscar auth provider-key --provider xai --key-file ~/.oscar-xai.key
+oscar auth provider-key --provider grok --key-file ~/.oscar-xai.key
 oscar auth aws-sso-login [--aws-profile NAME]    # browser SSO; keys never enter chat
 oscar auth gcloud-login [--adc]
 oscar auth az-login [--tenant TID]
@@ -65,11 +67,13 @@ oscar auth aws-test --profile aws-default
 oscar binaries
 ```
 
+In chat: **`/model`** lists models across all **loaded** providers; `/model 3` or `/model openai/gpt-4o` switches without unloading others. Details: [docs/AUTH-GROK.md](docs/AUTH-GROK.md).
+
 **Isolation guarantee:** raw credentials never enter the model transcript. Secure TUI paste and `oscar auth` write to the OS keychain or CSP CLI SSO only; tool results are deep-redacted (`***REDACTED***`). Built-in LLM providers **do not** read `XAI_API_KEY` / `OPENAI_API_KEY` unless `provider.api_key_env` is set for a **custom** provider.
 
 ## TUI
 
-`oscar` opens a chat **output panel** (user / agent / tools / system) and a bottom **input bar** with slash commands (`/settings`, `/identities`, `/skills`, `/help`, …) — same shape as Grok Build.
+`oscar` opens a chat **output panel** (user / agent / tools / system) and a bottom **input bar** with slash commands (`/model`, `/settings`, `/identities`, `/skills`, `/help`, …) — same shape as Grok Build.
 
 ## MCP (first-class, not in system prompt)
 

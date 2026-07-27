@@ -1694,16 +1694,26 @@ impl App {
                     if line == "/help" {
                         self.push_line(
                             LineKind::System,
-                            "/settings · /provider · /identities · /skills · /mcp · /thinking · /context · /compact · /history · /new · /resume · /copy · /quit",
+                            "/model · /provider · /settings · /identities · /skills · /mcp · /thinking · /context · /compact · /history · /new · /resume · /copy · /quit",
                         );
                         self.push_line(
                             LineKind::System,
-                            "Panes: Tab = chat↔input · ↑↓ select lines · Shift+↑↓ extend · y/Enter/Ctrl+Y copy · Ctrl+V paste",
+                            "/model list  ·  /model 2  ·  /model grok-4  ·  /model openai/gpt-4o  (multi-provider)",
                         );
                         self.push_line(
                             LineKind::System,
-                            "Input: Ctrl+A start · Ctrl+E end · Ctrl+U clear · Settings Ctrl+, · Identities Ctrl+I · mouse click/drag select",
+                            "Panes: Tab = chat↔input · ↑↓ select · y copy · Ctrl+V paste · Grok: oscar auth login",
                         );
+                        return;
+                    }
+                    // /model goes to host (list + switch across loaded providers)
+                    if line == "/model"
+                        || line == "/models"
+                        || line.starts_with("/model ")
+                        || line.starts_with("/models ")
+                    {
+                        self.push_line(LineKind::User, line.clone());
+                        self.pending_user = Some(line);
                         return;
                     }
                     // /copy [n] — Grok Build–style copy last (or Nth) assistant reply
