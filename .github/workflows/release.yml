@@ -87,17 +87,17 @@ jobs:
 
   build-macos:
     name: build ${{ matrix.target }}
+    # Optional: do not block Linux publish if macOS runners are unavailable.
+    continue-on-error: true
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Apple Silicon only (macos-13 Intel runners are often starved in queue)
           - target: aarch64-apple-darwin
             os: macos-14
             archive_latest: oscar-aarch64-apple-darwin.tar.gz
-          - target: x86_64-apple-darwin
-            os: macos-13
-            archive_latest: oscar-x86_64-apple-darwin.tar.gz
 
     steps:
       - uses: actions/checkout@v4
@@ -151,6 +151,7 @@ jobs:
 
   build-windows:
     name: build x86_64-pc-windows-msvc
+    continue-on-error: true
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -211,9 +212,10 @@ jobs:
 
   publish:
     name: publish GitHub Release
-    needs: [build-linux, build-macos, build-windows]
+    # Only wait on Linux (required). macOS/Windows are best-effort and must not
+    # block downloadable Linux artifacts when their runners are stuck queued.
+    needs: [build-linux]
     runs-on: ubuntu-latest
-    # Publish even if a non-Linux matrix leg fails (Linux is the primary distribution).
     if: >-
       always() &&
       needs.build-linux.result == 'success' &&
@@ -221,7 +223,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all build artifacts
+      # Best-effort: pull any finished optional platform artifacts without failing.
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+          pattern: oscar-*-unknown-linux-gnu*
+
+      - name: Download optional platform artifacts
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           path: dist
