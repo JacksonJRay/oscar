@@ -12,12 +12,6 @@ Release artifacts (Linux) are attached to GitHub Releases:
 
 ## [Unreleased]
 
-### Added
-
-- **Multi-profile access pivot:** `system.access.prepare` (create per-account profile + short-lived secure paste/SSO), `system.access.review` (list usable creds without values), `system.access.select` (session preferred profile). Also `system.profiles.list`.
-- Session `preferred_profile_id` so tools that omit `profile_id` target the active account; AWS ambient CLI only reused when account matches profile (no silent cross-account).
-- Secure bar: multi-field short-term paste (access/secret/session); resume only when all fields stored; agent never sees secret values.
-
 ### Planned
 
 - apt packages
@@ -26,19 +20,37 @@ Release artifacts (Linux) are attached to GitHub Releases:
 - Deeper multi-hop: auto-chain live path analyzers after locate (orchestrate currently inventory-only)
 - LLM turn-summarization during compaction (fold/trim already ship)
 
+## [0.1.3] — 2026-07-27
+
+Downloadable multi-arch GitHub Release with **multi-profile access** (test this build for account pivot + secure paste).
+
+### Added
+
+- **Multi-profile access pivot:** `system.access.prepare` (per-account profile + short-lived secure paste/SSO), `system.access.review` (usable creds without values), `system.access.select` (session preferred profile), `system.profiles.list`
+- Session `preferred_profile_id` — tools that omit `profile_id` target the active account
+- **CSP-distinct profiles:** ids `aws-*` / `gcp-*` / `azure-*` / `k8s-*`, `[AWS]`/`[GCP]`/`[AZURE]` tags, account_kind labels, lists grouped by cloud
+- Secure bar: multi-field short-term paste (access/secret/session); resume only when all fields stored; agent never sees secret values
+- AWS ambient CLI only reused when STS account matches profile `account_ref` (no silent cross-account)
+- `dns.resolve.public`; one-time legacy config dir import into `~/.config/oscar`
+
+### Fixed
+
+- Windows binary PATH probe (unix permissions gated); release publish proceeds when Linux builds succeed
+- CI CLI smoke broken-pipe panic with `head`
+
 ## [0.1.2] — 2026-07-27
 
-First downloadable GitHub Release for the **oscar** product (Linux x86_64 + aarch64 gnu, plus macOS/Windows in the same pipeline).
+Packaging baseline (tag may not have published artifacts). Prefer **v0.1.3**.
 
 ### Added
 
 - `dns.resolve.public` — host system resolver A/AAAA for a FQDN (public Internet)
-- One-time config import: if `~/.config/oscar` has no config/profiles but the pre-rebrand config dir exists, copy metadata (sessions, TOML, caches). Keychain secrets are **not** moved — re-run `oscar auth` as needed.
+- One-time config import from pre-rebrand config dir when oscar is empty
 
 ### Changed
 
 - Docs: MCP transport row reflects OAuth PKCE + DCR as shipped
-- `oscar-k8s` crate description matches live CNI tooling (no longer “stub”)
+- `oscar-k8s` crate description matches live CNI tooling
 
 ## [0.1.1] — 2026-07-27
 
