@@ -34,7 +34,11 @@ jobs:
           BIN=./target/debug/oscar
           "$BIN" --version
           "$BIN" --help >/dev/null
-          "$BIN" tools list | head -5
-          "$BIN" tools catalog | head -5
-          "$BIN" mcp presets | head -5
+          # Avoid Rust SIGPIPE/broken-pipe panic when piping to head
+          "$BIN" tools list > /tmp/oscar-tools-list.txt
+          head -5 /tmp/oscar-tools-list.txt
+          "$BIN" tools catalog > /tmp/oscar-tools-catalog.txt
+          head -5 /tmp/oscar-tools-catalog.txt
+          "$BIN" mcp presets > /tmp/oscar-mcp-presets.txt
+          head -5 /tmp/oscar-mcp-presets.txt
           "$BIN" inventory status || true
