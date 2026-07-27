@@ -34,6 +34,8 @@ pub struct AppConfig {
     pub tool_catalog: Vec<ToolCatalogEntry>,
     /// Path to profiles.toml for identity probes.
     pub profiles_path: PathBuf,
+    /// False when LLM key/provider is missing — TUI opens Provider setup.
+    pub provider_ready: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +84,8 @@ pub struct App {
     pub config: AppConfig,
     pub lines: Vec<ChatLine>,
     pub input: String,
+    /// Cursor position in **chars** within `input` (or secure buffer).
+    pub input_cursor: usize,
     pub input_mode: InputMode,
     pub status: String,
     pub context: Option<ContextSnapshot>,
@@ -142,6 +146,7 @@ impl App {
                     .into(),
             }],
             input: String::new(),
+            input_cursor: 0,
             input_mode: InputMode::Normal,
             status: String::new(),
             context: None,
@@ -170,7 +175,131 @@ impl App {
         app.trim_transcript();
         app.pin_to_bottom();
         app.refresh_status();
+        if !app.config.provider_ready {
+            app.open_provider_setup(
+                "No LLM provider key configured — pick a provider and paste your API key (secure bar).",
+            );
+        }
         app
+    }
+
+    /// Open Settings → Provider (used on first run / missing key).
+    pub fn open_provider_setup(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.push_line(LineKind::System, reason);
+        self.push_line(
+            LineKind::System,
+            "Provider setup: ←→ choose provider · ↓ «Paste API key» · Enter · key goes to OS keychain (agent never sees it).",
+        );
+        let pane = SettingsPane::open_provider(
+            self.config.oscar_config.clone(),
+            self.config.tool_catalog.clone(),
+        );
+        self.view = View::Settings(pane);
+    }
+
+    fn begin_provider_key_paste(&mut self, provider_id: String) {
+        use oscar_core::{Cloud, SecretKind};
+        self.config.oscar_config.provider.id = provider_id.clone();
+        self.config.provider = provider_id.clone();
+        let auth = AuthRequest::new(
+            Cloud::Multi,
+            format!("Paste API key for LLM provider `{provider_id}`"),
+            vec![SecretKind::ApiKey],
+        )
+        .profile(format!("provider:{provider_id}"))
+        .with_guidance(
+            "Key is stored in the OS keychain only. It is never shown in chat or sent to the agent transcript.",
+        )
+        .with_hints([
+            format!("oscar auth provider-key --provider {provider_id} --key-file …"),
+            "Or paste here in the secure bar (masked)".into(),
+        ]);
+        self.input_mode = InputMode::secure(auth);
+        self.input_cursor = 0;
+        self.push_line(
+            LineKind::System,
+            format!(
+                "SECURE: paste API key for `{provider_id}` (Ctrl+U clear · Esc cancel). Agent will not see the value."
+            ),
+        );
+    }
+
+    // ── input bar helpers (cursor + readline-style chords) ─────────────────
+
+    fn input_char_len(s: &str) -> usize {
+        s.chars().count()
+    }
+
+    fn byte_index_at(s: &str, char_idx: usize) -> usize {
+        s.char_indices()
+            .nth(char_idx)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len())
+    }
+
+    fn clamp_cursor(&mut self) {
+        let len = match &self.input_mode {
+            InputMode::Secure { buffer, .. } => Self::input_char_len(buffer),
+            InputMode::Normal => Self::input_char_len(&self.input),
+        };
+        if self.input_cursor > len {
+            self.input_cursor = len;
+        }
+    }
+
+    fn input_insert_char(&mut self, c: char) {
+        match &mut self.input_mode {
+            InputMode::Secure { buffer, .. } => {
+                let i = Self::byte_index_at(buffer, self.input_cursor);
+                buffer.insert(i, c);
+                self.input_cursor += 1;
+            }
+            InputMode::Normal => {
+                let i = Self::byte_index_at(&self.input, self.input_cursor);
+                self.input.insert(i, c);
+                self.input_cursor += 1;
+            }
+        }
+    }
+
+    fn input_backspace(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        match &mut self.input_mode {
+            InputMode::Secure { buffer, .. } => {
+                let start = Self::byte_index_at(buffer, self.input_cursor - 1);
+                let end = Self::byte_index_at(buffer, self.input_cursor);
+                buffer.replace_range(start..end, "");
+                self.input_cursor -= 1;
+            }
+            InputMode::Normal => {
+                let start = Self::byte_index_at(&self.input, self.input_cursor - 1);
+                let end = Self::byte_index_at(&self.input, self.input_cursor);
+                self.input.replace_range(start..end, "");
+                self.input_cursor -= 1;
+            }
+        }
+    }
+
+    fn input_clear(&mut self) {
+        match &mut self.input_mode {
+            InputMode::Secure { buffer, .. } => buffer.clear(),
+            InputMode::Normal => self.input.clear(),
+        }
+        self.input_cursor = 0;
+    }
+
+    fn input_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    fn input_end(&mut self) {
+        self.input_cursor = match &self.input_mode {
+            InputMode::Secure { buffer, .. } => Self::input_char_len(buffer),
+            InputMode::Normal => Self::input_char_len(&self.input),
+        };
     }
 
     /// Advance spinner when agent is active (call from frame loop).
@@ -394,6 +523,18 @@ impl App {
         self.view = View::Settings(pane);
     }
 
+    /// Mark LLM provider as ready (after successful key paste / config reload).
+    pub fn mark_provider_ready(&mut self, provider_id: &str, model: Option<&str>) {
+        self.config.provider_ready = true;
+        self.config.provider = provider_id.to_string();
+        self.config.oscar_config.provider.id = provider_id.to_string();
+        if let Some(m) = model {
+            self.config.model = m.to_string();
+            self.config.oscar_config.provider.model = Some(m.to_string());
+        }
+        self.refresh_status();
+    }
+
     pub fn open_identities(&mut self) {
         let inv = load_quick_identities(&self.config.profiles_path);
         self.view = View::Identities(IdentitiesPane::open(inv));
@@ -446,12 +587,24 @@ impl App {
         }
         self.show_thinking = cfg.ui.show_thinking || cfg.thinking.is_on();
         self.config.show_thinking = self.show_thinking;
+        self.config.provider_ready = oscar_identity::load_provider_api_key(&cfg.provider.id)
+            .ok()
+            .flatten()
+            .map(|k| !k.is_empty())
+            .unwrap_or(false);
         self.refresh_status();
     }
 
     pub fn handle_agent_event(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::ContentDelta { text } => {
+                if text.contains("[provider ready") {
+                    // Host stored LLM key and built agent — allow chat.
+                    let pid = self.config.provider.clone();
+                    self.mark_provider_ready(&pid, None);
+                    self.push_line(LineKind::System, text.trim().to_string());
+                    return;
+                }
                 self.streaming = true;
                 // Close thinking block when answer starts
                 if self.thinking_open {
@@ -704,7 +857,16 @@ impl App {
                 );
             }
             AgentEvent::Error { message } => {
+                let needs_provider = message.to_ascii_lowercase().contains("no llm provider")
+                    || message.to_ascii_lowercase().contains("provider not ready")
+                    || message.to_ascii_lowercase().contains("no api key for provider")
+                    || message.to_ascii_lowercase().contains("provider-key");
                 self.push_line(LineKind::Error, message);
+                if needs_provider && !self.config.provider_ready {
+                    self.open_provider_setup(
+                        "LLM provider missing or not ready — open Provider settings to select and paste a key.",
+                    );
+                }
             }
             AgentEvent::Done { .. } => {
                 if self.thinking_open {
@@ -775,41 +937,97 @@ impl App {
             return;
         }
 
+        // Input bar chords (work in normal + secure modes)
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('u') | KeyCode::Char('U') => {
+                    self.input_clear();
+                    return;
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.input_home();
+                    return;
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    // Ctrl+E = end of input bar (not End chat scroll)
+                    if matches!(self.input_mode, InputMode::Secure { .. })
+                        || matches!(self.view, View::Chat)
+                    {
+                        self.input_end();
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         match &mut self.input_mode {
             InputMode::Secure {
                 auth,
                 kind_index,
-                buffer,
+                buffer: _,
             } => match key.code {
                 KeyCode::Esc => {
                     self.input_mode = InputMode::Normal;
+                    self.input_cursor = 0;
                     self.push_line(LineKind::System, "Credential entry cancelled.");
                 }
                 KeyCode::Backspace => {
-                    buffer.pop();
+                    self.input_backspace();
                 }
+                KeyCode::Left => {
+                    if self.input_cursor > 0 {
+                        self.input_cursor -= 1;
+                    }
+                }
+                KeyCode::Right => {
+                    self.input_cursor = self.input_cursor.saturating_add(1);
+                    self.clamp_cursor();
+                }
+                KeyCode::Home => self.input_home(),
+                KeyCode::End => self.input_end(),
                 KeyCode::Enter => {
-                    if buffer.is_empty() {
+                    let empty = match &self.input_mode {
+                        InputMode::Secure { buffer, .. } => buffer.is_empty(),
+                        _ => true,
+                    };
+                    if empty {
                         return;
                     }
-                    let kind = auth.kinds.get(*kind_index).copied();
-                    if let Some(kind) = kind {
+                    // re-borrow for mutation after empty check
+                    let (kind, secret, auth_clone, done) = {
+                        let InputMode::Secure {
+                            auth,
+                            kind_index,
+                            buffer,
+                        } = &mut self.input_mode
+                        else {
+                            return;
+                        };
+                        let kind = auth.kinds.get(*kind_index).copied();
+                        let Some(kind) = kind else { return };
                         let secret = std::mem::take(buffer);
                         let auth_clone = auth.clone();
                         let next = *kind_index + 1;
-                        if next < auth.kinds.len() {
+                        let done = next >= auth.kinds.len();
+                        if !done {
                             *kind_index = next;
-                            self.pending_secret = Some((auth_clone, kind, secret));
-                        } else {
-                            self.pending_secret = Some((auth_clone, kind, secret));
-                            self.input_mode = InputMode::Normal;
                         }
+                        (kind, secret, auth_clone, done)
+                    };
+                    self.pending_secret = Some((auth_clone, kind, secret));
+                    self.input_cursor = 0;
+                    if done {
+                        self.input_mode = InputMode::Normal;
                     }
                 }
-                KeyCode::Char(c) => {
-                    buffer.push(c);
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.input_insert_char(c);
                 }
-                _ => {}
+                _ => {
+                    let _ = auth;
+                    let _ = kind_index;
+                }
             },
             InputMode::Normal => match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -847,15 +1065,40 @@ impl App {
                     self.chat_scroll = self.max_chat_scroll();
                     self.stick_to_bottom = self.chat_scroll == 0;
                 }
-                KeyCode::End => {
+                KeyCode::Home => self.input_home(),
+                KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.pin_to_bottom();
+                }
+                KeyCode::End => {
+                    self.input_end();
+                }
+                KeyCode::Left => {
+                    if self.input_cursor > 0 {
+                        self.input_cursor -= 1;
+                    }
+                }
+                KeyCode::Right => {
+                    self.input_cursor = self.input_cursor.saturating_add(1);
+                    self.clamp_cursor();
                 }
                 KeyCode::Enter => {
                     let line = self.input.trim().to_string();
                     if line.is_empty() || self.streaming {
                         return;
                     }
+                    if !self.config.provider_ready
+                        && !line.starts_with('/')
+                        && line != "/quit"
+                        && line != "/exit"
+                    {
+                        // Chat needs an LLM — open provider setup instead of failing later.
+                        self.open_provider_setup(
+                            "LLM provider not ready — set one up before chatting.",
+                        );
+                        return;
+                    }
                     self.input.clear();
+                    self.input_cursor = 0;
                     // Next tip after a send (fresh guidance while waiting / idle again)
                     self.idle_hint.next();
                     if line == "/quit" || line == "/exit" {
@@ -871,6 +1114,13 @@ impl App {
                     }
                     if matches!(
                         line.as_str(),
+                        "/provider" | "/providers" | "/llm" | "/api-key" | "/apikey"
+                    ) {
+                        self.open_provider_setup("Provider / API key setup");
+                        return;
+                    }
+                    if matches!(
+                        line.as_str(),
                         "/identities" | "/identity" | "/access" | "/whoami"
                     ) {
                         self.open_identities();
@@ -879,15 +1129,11 @@ impl App {
                     if line == "/help" {
                         self.push_line(
                             LineKind::System,
-                            "/settings · /identities · /skills · /mcp · /thinking · /context · /compact · /history · /new · /resume · /quit",
+                            "/settings · /provider · /identities · /skills · /mcp · /thinking · /context · /compact · /history · /new · /resume · /quit",
                         );
                         self.push_line(
                             LineKind::System,
-                            "Chat history auto-saves · /history lists sessions · /new fresh chat · /resume <id>",
-                        );
-                        self.push_line(
-                            LineKind::System,
-                            "Settings Ctrl+, · Identities Ctrl+I · approve install | deny install",
+                            "Input: Ctrl+A start · Ctrl+E end · Ctrl+U clear · Settings Ctrl+, · Identities Ctrl+I",
                         );
                         return;
                     }
@@ -936,10 +1182,10 @@ impl App {
                     self.pending_user = Some(line);
                 }
                 KeyCode::Backspace => {
-                    self.input.pop();
+                    self.input_backspace();
                 }
-                KeyCode::Char(c) => {
-                    self.input.push(c);
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.input_insert_char(c);
                 }
                 _ => {}
             },
@@ -987,6 +1233,14 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 pane.activate();
+                if let Some(crate::settings::SettingsAction::PasteProviderApiKey { provider_id }) =
+                    pane.take_action()
+                {
+                    // Persist provider selection then open secure paste.
+                    self.close_settings(true);
+                    self.begin_provider_key_paste(provider_id);
+                    return;
+                }
             }
             KeyCode::Char('[') => {
                 pane.activate_back();

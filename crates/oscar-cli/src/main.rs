@@ -3171,6 +3171,7 @@ async fn run_chat_with_session(
         oscar_config: cfg.clone(),
         tool_catalog,
         profiles_path: paths.profiles_file.clone(),
+        provider_ready: provider_result.is_ok(),
     });
 
     // Load or create persistent chat session (Grok Build–style history)
@@ -3337,6 +3338,64 @@ async fn run_chat_with_session(
                 }
                 Some((auth, kind, secret)) = secret_rx.recv() => {
                     // Store secret into keychain only — never log value or send it to the agent/model.
+                    use oscar_core::SecretKind;
+                    let secret_len = secret.len();
+
+                    // LLM provider key paste: profile_hint = "provider:<id>"
+                    if kind == SecretKind::ApiKey {
+                        if let Some(hint) = auth.profile_hint.as_deref() {
+                            if let Some(pid) = hint.strip_prefix("provider:") {
+                                match store_provider_api_key(pid, &secret) {
+                                    Ok(()) => {
+                                        drop(secret);
+                                        cfg.provider.id = pid.to_string();
+                                        let _ = cfg.save(&paths);
+                                        let _ = event_tx_host
+                                            .send(AgentEvent::ContentDelta {
+                                                text: format!(
+                                                    "\n[secure bar] stored API key for provider `{pid}` ({secret_len} bytes) — value NOT visible to agent. Building agent…\n"
+                                                ),
+                                            })
+                                            .await;
+                                        match build_agent(&cfg, &paths).await {
+                                            Ok(mut a) => {
+                                                a.load_chat_history(&stored);
+                                                a.session.id = stored.id.clone();
+                                                a.session.title = stored.title.clone();
+                                                agent = Some(a);
+                                                let _ = event_tx_host
+                                                    .send(AgentEvent::ContentDelta {
+                                                        text: format!(
+                                                            "\n[provider ready: {pid} — you can chat now]\n"
+                                                        ),
+                                                    })
+                                                    .await;
+                                            }
+                                            Err(e) => {
+                                                let _ = event_tx_host
+                                                    .send(AgentEvent::Error {
+                                                        message: format!(
+                                                            "Provider key stored but agent still not ready: {e}"
+                                                        ),
+                                                    })
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        drop(secret);
+                                        let _ = event_tx_host
+                                            .send(AgentEvent::Error {
+                                                message: format!("failed to store provider key: {e}"),
+                                            })
+                                            .await;
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
                     let mut store = match ProfileStore::load(&paths) {
                         Ok(s) => s,
                         Err(e) => {
@@ -3356,7 +3415,6 @@ async fn run_chat_with_session(
                     }
                     let mut all_kinds_ready = false;
                     if let Some(p) = store.get(&profile_id) {
-                        let secret_len = secret.len();
                         if let Err(e) = KeychainStore::set(&p.secret_keyring_id, kind, &secret) {
                             let _ = event_tx_host.send(AgentEvent::Error { message: e.to_string() }).await;
                         } else {
@@ -3542,7 +3600,7 @@ async fn run_chat_with_session(
                     }
                     let Some(agent) = agent.as_mut() else {
                         let _ = event_tx_host.send(AgentEvent::Error {
-                            message: "No LLM provider configured. Use `oscar auth provider-key --provider …` or `--llm-api-key` (not ambient XAI_/OPENAI_ env).".into(),
+                            message: "No LLM provider configured. Opening Provider setup — select a provider and paste an API key (secure bar), or run: oscar auth provider-key --provider …".into(),
                         }).await;
                         let _ = event_tx_host.send(AgentEvent::Done { usage: None }).await;
                         continue;

@@ -303,7 +303,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
         }
     };
 
-    let para = match &app.input_mode {
+    let (text_style, border_fg, show_cursor) = match &app.input_mode {
         InputMode::Normal if app.show_idle_input_hint() => {
             // Grok Build–style: dim cycling tooltip inside the empty input field
             let hint = app.idle_hint.current();
@@ -316,26 +316,48 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
                         .add_modifier(Modifier::ITALIC),
                 ),
             ]);
-            Paragraph::new(line).block(
+            let para = Paragraph::new(line).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(title)
                     .border_style(Style::default().fg(Color::DarkGray)),
-            )
+            );
+            f.render_widget(para, area);
+            return;
         }
-        InputMode::Normal => Paragraph::new(format!("> {}", app.input))
-            .style(Style::default().fg(Color::White))
-            .block(Block::default().borders(Borders::ALL).title(title)),
-        InputMode::Secure { buffer, .. } => Paragraph::new(format!("> {}", "•".repeat(buffer.len())))
-            .style(Style::default().fg(Color::Yellow))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_style(Style::default().fg(Color::Yellow)),
-            ),
+        InputMode::Normal => (Style::default().fg(Color::White), Color::White, true),
+        InputMode::Secure { .. } => (Style::default().fg(Color::Yellow), Color::Yellow, true),
     };
+
+    let display = match &app.input_mode {
+        InputMode::Secure { buffer, .. } => format!("> {}", "•".repeat(buffer.chars().count())),
+        InputMode::Normal => format!("> {}", app.input),
+    };
+    let title_extra = if show_cursor {
+        " · ^A start ^E end ^U clear "
+    } else {
+        ""
+    };
+    let full_title = format!("{title}{title_extra}");
+    let para = Paragraph::new(display)
+        .style(text_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(full_title)
+                .border_style(Style::default().fg(border_fg)),
+        );
     f.render_widget(para, area);
+
+    // Place terminal cursor in the input bar (after "> " + cursor chars).
+    if show_cursor && area.width > 3 && area.height > 0 {
+        let col = 2u16.saturating_add(app.input_cursor.min(u16::MAX as usize) as u16);
+        // Stay inside the inner border
+        let max_col = area.width.saturating_sub(2);
+        let x = area.x.saturating_add(1).saturating_add(col.min(max_col));
+        let y = area.y.saturating_add(1);
+        f.set_cursor_position((x, y));
+    }
 }
 
 /// Centered modal: category sidebar + item list (Grok Build–style).

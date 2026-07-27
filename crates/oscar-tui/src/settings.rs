@@ -92,6 +92,13 @@ pub struct SettingsItem {
     pub kind: ItemKind,
 }
 
+/// Side-effect requests from the settings pane (handled by App).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsAction {
+    /// Close settings and open secure paste for the selected LLM provider key.
+    PasteProviderApiKey { provider_id: String },
+}
+
 /// Live settings editor state (modal overlay).
 pub struct SettingsPane {
     pub config: OscarConfig,
@@ -104,6 +111,8 @@ pub struct SettingsPane {
     pub item_scroll: usize,
     /// Flash message after toggle.
     pub flash: Option<String>,
+    /// One-shot action for the host App (e.g. open secure API-key paste).
+    pub pending_action: Option<SettingsAction>,
 }
 
 impl SettingsPane {
@@ -117,7 +126,27 @@ impl SettingsPane {
             tool_filter: String::new(),
             item_scroll: 0,
             flash: Some("↑↓ navigate · ←→ category · Enter/Space toggle · Esc save & close".into()),
+            pending_action: None,
         }
+    }
+
+    /// Open focused on the Provider category (first-run / missing LLM key).
+    pub fn open_provider(config: OscarConfig, catalog: Vec<ToolCatalogEntry>) -> Self {
+        let mut pane = Self::open(config, catalog);
+        pane.category_idx = SettingsCategory::ALL
+            .iter()
+            .position(|c| *c == SettingsCategory::Provider)
+            .unwrap_or(0);
+        pane.item_idx = 1; // "Provider" enum row (after header)
+        pane.flash = Some(
+            "Set up LLM provider: ←→ choose provider · ↓ to «Paste API key» · Enter · Esc saves"
+                .into(),
+        );
+        pane
+    }
+
+    pub fn take_action(&mut self) -> Option<SettingsAction> {
+        self.pending_action.take()
     }
 
     pub fn category(&self) -> SettingsCategory {
@@ -573,20 +602,51 @@ impl SettingsPane {
             .iter()
             .position(|p| *p == self.config.provider.id)
             .unwrap_or(0);
+        let key_present = oscar_identity::load_provider_api_key(&self.config.provider.id)
+            .ok()
+            .flatten()
+            .map(|k| !k.is_empty())
+            .unwrap_or(false);
         vec![
             SettingsItem {
                 id: "hdr".into(),
                 label: "LLM provider".into(),
-                description: "Keys via oscar auth provider-key (keychain)".into(),
+                description: "Keys stored in OS keychain (never in chat). Select provider then paste key.".into(),
                 kind: ItemKind::Header,
             },
             SettingsItem {
                 id: "provider_id".into(),
                 label: "Provider".into(),
-                description: "←→ cycle · store key: oscar auth provider-key --provider …".into(),
+                description: "←→ cycle · xai / openai / anthropic / opencode-zen / opencode-go".into(),
                 kind: ItemKind::Enum {
                     options: providers.to_vec(),
                     index: idx,
+                },
+            },
+            SettingsItem {
+                id: "paste_provider_key".into(),
+                label: if key_present {
+                    "Paste / replace API key"
+                } else {
+                    "Paste API key (required)"
+                }
+                .into(),
+                description: "Enter opens secure bar — agent never sees the value".into(),
+                kind: ItemKind::Toggle {
+                    // Not a real toggle — activate() treats this id specially.
+                    on: key_present,
+                },
+            },
+            SettingsItem {
+                id: "key_status".into(),
+                label: "Keychain status".into(),
+                description: "Whether a key is stored for the selected provider".into(),
+                kind: ItemKind::Info {
+                    value: if key_present {
+                        format!("key present for `{}`", self.config.provider.id)
+                    } else {
+                        format!("NO KEY for `{}` — paste required", self.config.provider.id)
+                    },
                 },
             },
             SettingsItem {
@@ -664,8 +724,21 @@ impl SettingsPane {
         self.item_idx = i as usize;
     }
 
-    /// Activate selected item (toggle / cycle forward).
+    /// Activate selected item (toggle / cycle forward / action).
     pub fn activate(&mut self) {
+        let items = self.items();
+        if let Some(item) = items.get(self.item_idx) {
+            if item.id == "paste_provider_key" {
+                self.pending_action = Some(SettingsAction::PasteProviderApiKey {
+                    provider_id: self.config.provider.id.clone(),
+                });
+                self.flash = Some(format!(
+                    "Opening secure paste for provider `{}`…",
+                    self.config.provider.id
+                ));
+                return;
+            }
+        }
         self.apply_delta(1);
     }
 

@@ -10,7 +10,8 @@ pub const IDLE_HINT_INTERVAL: Duration = Duration::from_millis(3800);
 /// Cycling help tooltips shown in the input bar when empty (chat, normal mode).
 pub const IDLE_INPUT_HINTS: &[&str] = &[
     "Ask about multi-cloud DNS, network paths, or k8s…",
-    "Type /help for slash commands · /settings opens config (Ctrl+,)",
+    "Type /help · /provider for LLM setup · /settings (Ctrl+,)",
+    "Input bar: Ctrl+A start · Ctrl+E end · Ctrl+U clear",
     "Discover tools via Code Mode: agent uses tools_search then tools_execute",
     "Sync inventory: oscar inventory sync --cloud aws --kind dns",
     "Private DNS map: ask about forwarding or /mcp for external tools",
