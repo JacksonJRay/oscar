@@ -248,9 +248,37 @@ pub fn load_session(paths: &Paths, id: &str) -> OscarResult<StoredChatSession> {
         return Err(OscarError::Config(format!("session not found: {id}")));
     }
     let raw = fs::read_to_string(&path)?;
-    let s: StoredChatSession = serde_json::from_str(&raw)
+    let mut s: StoredChatSession = serde_json::from_str(&raw)
         .map_err(|e| OscarError::Config(format!("parse session {id}: {e}")))?;
+    // Rewrite pre-rebrand "mind session" banners in UI transcript.
+    if rebrand_legacy_mind_transcript(&mut s) {
+        // Best-effort persist so the TUI does not keep showing mind branding.
+        let _ = save_session(paths, &s);
+    }
     Ok(s)
+}
+
+/// Replace leftover mind → oscar branding in session UI transcript lines.
+/// Returns true if any line was changed.
+pub fn rebrand_legacy_mind_transcript(session: &mut StoredChatSession) -> bool {
+    let mut changed = false;
+    for line in &mut session.transcript {
+        let next = rebrand_mind_text(&line.text);
+        if next != line.text {
+            line.text = next;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn rebrand_mind_text(text: &str) -> String {
+    text.replace("mind session", "oscar session")
+        .replace("Mind session", "oscar session")
+        .replace("MIND session", "oscar session")
+        .replace("~/.config/mind/sessions", "~/.config/oscar/sessions")
+        .replace("~/.config/mind", "~/.config/oscar")
+        .replace("/config/mind/", "/config/oscar/")
 }
 
 pub fn delete_session(paths: &Paths, id: &str) -> OscarResult<()> {
@@ -371,6 +399,20 @@ mod tests {
             mcp_credentials_file: dir.join("mcp_credentials.json"),
             auth_file: dir.join("auth.json"),
         }
+    }
+
+    #[test]
+    fn rebrand_mind_session_banner() {
+        let mut s = StoredChatSession::new("xai", "grok", "readonly");
+        s.transcript[0].text = format!(
+            "mind session `{}` — history saved under ~/.config/mind/sessions/ · /history · /new",
+            s.id
+        );
+        assert!(rebrand_legacy_mind_transcript(&mut s));
+        assert!(s.transcript[0].text.contains("oscar session"));
+        assert!(s.transcript[0].text.contains("~/.config/oscar/sessions"));
+        assert!(!s.transcript[0].text.contains("mind session"));
+        assert!(!s.transcript[0].text.contains("~/.config/mind"));
     }
 
     #[test]
