@@ -3,7 +3,7 @@ name = "oscar-k8s"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Kubernetes cluster pivoting tools for oscar (stub in v0)"
+description = "Kubernetes inventory, CNI (Cilium/Hubble/Calico), and cluster pivoting tools for oscar"
 
 [dependencies]
 oscar-core.workspace = true

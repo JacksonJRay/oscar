@@ -19,7 +19,7 @@ Architecture and patterns are **inspired by** [Grok Build](https://github.com/xa
 
 ## Status
 
-`v0.1.0` usable dredger: agent harness, pattern discovery, multi-cloud DNS/network live inventory, path analyzers, IAM access tools, k8s/CNI helpers, settings/identities TUI, skills, **Grok-style auto-compact (85%)**, and **MCP servers mounted as first-class Code Mode tools** (search/execute — not dumped into context). Config is **TOML** at `~/.config/oscar/config.toml`.
+`v0.1.2` usable dredger: agent harness, pattern discovery, multi-cloud DNS/network live inventory, path analyzers, IAM access tools, k8s/CNI helpers, settings/identities TUI, skills, **Grok-style auto-compact (85%)**, and **MCP servers mounted as first-class Code Mode tools** (search/execute — not dumped into context). Config is **TOML** at `~/.config/oscar/config.toml`.
 
 ## Install
 

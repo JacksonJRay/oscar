@@ -24,7 +24,7 @@ impl Paths {
         let config_dir = dirs::config_dir()
             .ok_or_else(|| OscarError::Config("could not resolve config directory".into()))?
             .join("oscar");
-        Ok(Self {
+        let paths = Self {
             config_file: config_dir.join("config.toml"),
             profiles_file: config_dir.join("profiles.toml"),
             sessions_dir: config_dir.join("sessions"),
@@ -32,7 +32,10 @@ impl Paths {
             logs_dir: config_dir.join("logs"),
             mcp_credentials_file: config_dir.join("mcp_credentials.json"),
             config_dir,
-        })
+        };
+        // Best-effort one-time import from the pre-rebrand config dir if oscar is empty.
+        let _ = migrate_legacy_config_dir(&paths);
+        Ok(paths)
     }
 
     pub fn ensure(&self) -> OscarResult<()> {
@@ -42,6 +45,55 @@ impl Paths {
         fs::create_dir_all(&self.logs_dir)?;
         Ok(())
     }
+}
+
+/// Copy `~/.config/mind` → `~/.config/oscar` once when oscar has no user config yet.
+///
+/// Secrets in the OS keychain are **not** moved (keychain service is now `oscar`);
+/// re-store LLM/cloud keys with `oscar auth` if needed. Profiles metadata + sessions
+/// + MCP server list are copied.
+fn migrate_legacy_config_dir(paths: &Paths) -> OscarResult<bool> {
+    let Some(base) = dirs::config_dir() else {
+        return Ok(false);
+    };
+    let legacy = base.join("mind");
+    if !legacy.is_dir() {
+        return Ok(false);
+    }
+    // Skip if oscar already has config or profiles (user already set up).
+    if paths.config_file.exists() || paths.profiles_file.exists() {
+        return Ok(false);
+    }
+    let marker = paths.config_dir.join(".migrated_from_legacy");
+    if marker.exists() {
+        return Ok(false);
+    }
+
+    fs::create_dir_all(&paths.config_dir)?;
+    copy_dir_contents(&legacy, &paths.config_dir)?;
+    let note = format!(
+        "Imported user config from {} at {}.\n\
+         Keychain secrets still use service name oscar (re-run oscar auth for LLM/cloud keys if missing).\n",
+        legacy.display(),
+        chrono::Utc::now().to_rfc3339()
+    );
+    let _ = fs::write(&marker, note);
+    Ok(true)
+}
+
+fn copy_dir_contents(src: &std::path::Path, dst: &std::path::Path) -> OscarResult<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_contents(&from, &to)?;
+        } else if !to.exists() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,5 +569,21 @@ mod tests {
         assert!(back.tools.disabled_clouds.contains(&"gcp".into()));
         assert!(back.tools.disabled.contains(&"k8s.pods.list".into()));
         assert!(back.tools.agent_summary().contains("install-all"));
+    }
+
+    #[test]
+    fn copy_dir_contents_nested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(src.join("sessions")).unwrap();
+        fs::write(src.join("config.toml"), "mode = \"readonly\"\n").unwrap();
+        fs::write(src.join("sessions").join("a.json"), "{}").unwrap();
+        copy_dir_contents(&src, &dst).unwrap();
+        assert_eq!(
+            fs::read_to_string(dst.join("config.toml")).unwrap(),
+            "mode = \"readonly\"\n"
+        );
+        assert!(dst.join("sessions").join("a.json").is_file());
     }
 }

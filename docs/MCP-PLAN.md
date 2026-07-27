@@ -70,7 +70,7 @@ install_hint = "Node + npx, or npm i -g @modelcontextprotocol/server-filesystem"
 | Discovery | `search_tool` (MCP-only meta-tool) | `tools_search` (unified inventory: native + MCP) |
 | Execute | `use_tool` with `server__tool` | `tools_execute` with `mcp.<server>.<tool>` (also accepts `server__tool`) |
 | Context cost | MCP not dumped into system prompt | Same: fixed two agent tools |
-| Transport | stdio + HTTP/SSE + OAuth | stdio (HTTP/SSE schema ready; OAuth open) |
+| Transport | stdio + HTTP/SSE + OAuth | stdio + HTTP/SSE + OAuth PKCE (refresh + DCR) |
 | Result size | truncate + spill under session `mcp/` | truncate + spill under `artifacts/mcp/` |
 | Write safety | permission rules `MCPTool(server__*)` | mode gate + capability inference |
 

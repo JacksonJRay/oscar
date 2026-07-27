@@ -20,6 +20,7 @@ pub fn register_multi(registry: &mut ToolRegistry) {
     registry.register(Arc::new(DnsPatternFind));
     registry.register(Arc::new(NetworkPatternFind));
     registry.register(Arc::new(DnsWhere));
+    registry.register(Arc::new(DnsResolvePublic));
     registry.register(Arc::new(DnsInventorySyncMulti));
     registry.register(Arc::new(DnsForwardingMap));
     registry.register(Arc::new(DnsQuerylogHints));
@@ -1069,6 +1070,89 @@ impl Tool for DnsWhere {
                 .or_insert(json!(true));
         }
         DnsPatternFind.execute(args, ctx).await
+    }
+}
+
+struct DnsResolvePublic;
+
+/// Plan tool `dns.resolve.public` — system resolver A/AAAA (no CSP inventory).
+#[async_trait]
+impl Tool for DnsResolvePublic {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "dns.resolve.public".into(),
+            name: "Public DNS resolve".into(),
+            description: "Resolve a FQDN via the host system resolver (public Internet A/AAAA). Does not query private CSP zones — use dns.where / dns.pattern.find for inventory. Fast check for public reachability of a name.".into(),
+            domain: ToolDomain::Dns,
+            clouds: vec![Cloud::Multi],
+            capability: Capability::Read,
+            tags: vec![
+                "dns".into(),
+                "public".into(),
+                "resolve".into(),
+                "a".into(),
+                "aaaa".into(),
+                "lookup".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Fully-qualified domain name (e.g. api.example.com)"
+                    },
+                    "query": { "type": "string", "description": "Alias for name" }
+                },
+                "required": ["name"]
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+        let name = args
+            .get("name")
+            .or_else(|| args.get("query"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('.');
+        if name.is_empty() {
+            return ToolResult::error("name is required (FQDN)");
+        }
+        if name.contains('*') || name.contains(' ') {
+            return ToolResult::error("name must be a concrete FQDN (no wildcards/spaces)");
+        }
+        let hits = PublicDnsProbe::resolve_name(name).await;
+        if hits.is_empty() {
+            return ToolResult::success(
+                format!("public resolve: no A/AAAA for `{name}`"),
+                json!({
+                    "query": name,
+                    "scope": "public_system_resolver",
+                    "records": [],
+                    "ok": false,
+                }),
+            );
+        }
+        let ips: Vec<String> = hits
+            .iter()
+            .filter_map(|h| h.attrs.get("values"))
+            .filter_map(|v| v.as_array())
+            .flat_map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())))
+            .collect();
+        ToolResult::success(
+            format!("public resolve `{name}` → {}", ips.join(", ")),
+            json!({
+                "query": name,
+                "scope": "public_system_resolver",
+                "records": hits,
+                "values": ips,
+                "ok": true,
+                "format": "DnsLookupResult-ish",
+            }),
+        )
     }
 }
 

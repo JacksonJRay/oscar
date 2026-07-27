@@ -530,7 +530,8 @@ fn agent_notes_for_tool(id: &str, description: &str, cap: Capability) -> String 
     if id.contains("inventory.sync") {
         notes.push("Fills unified inventory cache used by pattern.search tools. Prefer sync before first pattern search in a session if cache empty.".into());
     }
-    if id.contains("pattern") || id == "dns.where" || id == "dns.pattern.find" {
+    if id.contains("pattern") || id == "dns.where" || id == "dns.pattern.find" || id == "dns.resolve.public"
+    {
         notes.push("High-accuracy discovery: partial/glob/IP fragment search. Prefer over multi-step list+filter.".into());
     }
     if id.contains("path.analyze") || id.contains("connectivity") || id.contains("troubleshoot") {

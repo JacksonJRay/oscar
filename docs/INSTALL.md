@@ -31,11 +31,11 @@ sudo install -m 755 oscar /usr/local/bin/oscar
 oscar --version
 ```
 
-Pinned version (replace `v0.1.0`):
+Pinned version (replace `v0.1.2`):
 
 ```text
-https://github.com/JacksonJRay/oscar/releases/download/v0.1.0/oscar-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-https://github.com/JacksonJRay/oscar/releases/download/v0.1.0/oscar-x86_64-unknown-linux-gnu.tar.gz
+https://github.com/JacksonJRay/oscar/releases/download/v0.1.2/oscar-v0.1.2-x86_64-unknown-linux-gnu.tar.gz
+https://github.com/JacksonJRay/oscar/releases/download/v0.1.2/oscar-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 ## Prerequisites

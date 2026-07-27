@@ -29,7 +29,7 @@ AUTH / SAFETY
 
 COMMON TOOL FAMILIES
 - Inventory sync: aws|gcp|azure.dns.inventory.sync, *.network.inventory.sync, k8s.inventory.sync, *.dns.resolver.inventory.sync
-- Pattern discovery: dns.pattern.find, dns.where, *.dns.pattern.search, network.pattern.find, *.network.pattern.search, *.ip.locate, k8s.*.pattern.search
+- Pattern discovery: dns.pattern.find, dns.where, dns.resolve.public, *.dns.pattern.search, network.pattern.find, *.network.pattern.search, *.ip.locate, k8s.*.pattern.search
 - Private DNS / hybrid: aws.dns.resolver.*, gcp.dns.policy.*, azure.dns.vnet_link.*, azure.dns.private_resolver.*, dns.forwarding.map
 - Path troubleshooting: aws.network.path.analyze, aws.network.access.analyze, gcp.network.connectivity.test, azure.network.path.troubleshoot, azure.network.next_hop
 - K8s CNI: k8s.cni.detect, k8s.hubble.*, k8s.calico.*, k8s.cilium.*, k8s.networkpolicy.deny.narrative, k8s.coredns.discover

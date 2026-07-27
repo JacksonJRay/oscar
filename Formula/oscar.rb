@@ -13,28 +13,28 @@
 class Oscar < Formula
   desc "Multi-cloud Native Dredger — agentic CLI for AWS/GCP/Azure/K8s"
   homepage "https://github.com/JacksonJRay/oscar"
-  version "0.1.1"
+  version "0.1.2"
   license "Apache-2.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/JacksonJRay/oscar/releases/download/v0.1.1/oscar-v0.1.1-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/JacksonJRay/oscar/releases/download/v0.1.2/oscar-v0.1.2-aarch64-apple-darwin.tar.gz"
       # Update from release SHA256SUMS after tagging:
       sha256 "REPLACE_WITH_SHA256_FROM_RELEASE_SHA256SUMS"
     end
     on_intel do
-      url "https://github.com/JacksonJRay/oscar/releases/download/v0.1.1/oscar-v0.1.1-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/JacksonJRay/oscar/releases/download/v0.1.2/oscar-v0.1.2-x86_64-apple-darwin.tar.gz"
       sha256 "REPLACE_WITH_SHA256_FROM_RELEASE_SHA256SUMS"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/JacksonJRay/oscar/releases/download/v0.1.1/oscar-v0.1.1-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/JacksonJRay/oscar/releases/download/v0.1.2/oscar-v0.1.2-aarch64-unknown-linux-gnu.tar.gz"
       sha256 "REPLACE_WITH_SHA256_FROM_RELEASE_SHA256SUMS"
     end
     on_intel do
-      url "https://github.com/JacksonJRay/oscar/releases/download/v0.1.1/oscar-v0.1.1-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/JacksonJRay/oscar/releases/download/v0.1.2/oscar-v0.1.2-x86_64-unknown-linux-gnu.tar.gz"
       sha256 "REPLACE_WITH_SHA256_FROM_RELEASE_SHA256SUMS"
     end
   end

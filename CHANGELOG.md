@@ -17,12 +17,28 @@ Release artifacts (Linux) are attached to GitHub Releases:
 - apt packages
 - Windows MSI (zip already shipping)
 - Optional IDE local SSE server (post-v0)
+- Deeper multi-hop: auto-chain live path analyzers after locate (orchestrate currently inventory-only)
+- LLM turn-summarization during compaction (fold/trim already ship)
+
+## [0.1.2] — 2026-07-27
+
+First downloadable GitHub Release for the **oscar** product (Linux x86_64 + aarch64 gnu, plus macOS/Windows in the same pipeline).
+
+### Added
+
+- `dns.resolve.public` — host system resolver A/AAAA for a FQDN (public Internet)
+- One-time config import: if `~/.config/oscar` has no config/profiles but the pre-rebrand config dir exists, copy metadata (sessions, TOML, caches). Keychain secrets are **not** moved — re-run `oscar auth` as needed.
+
+### Changed
+
+- Docs: MCP transport row reflects OAuth PKCE + DCR as shipped
+- `oscar-k8s` crate description matches live CNI tooling (no longer “stub”)
 
 ## [0.1.1] — 2026-07-27
 
 ### Changed
 
-- **Rebrand:** product and CLI renamed from `mind` → **`oscar`**. Crates `mind-*` → `oscar-*`, binary `oscar`, config `~/.config/oscar`, keychain service `oscar`, repository [JacksonJRay/oscar](https://github.com/JacksonJRay/oscar).
+- **Rebrand:** product and CLI renamed to **`oscar`**. Crates `oscar-*`, binary `oscar`, config `~/.config/oscar`, keychain service `oscar`, repository [JacksonJRay/oscar](https://github.com/JacksonJRay/oscar).
 
 ### Added
 
