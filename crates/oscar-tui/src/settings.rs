@@ -75,10 +75,12 @@ pub enum SettingsCategory {
     Ui,
     Provider,
     Identities,
+    /// Live TOML of the effective user config (secrets stay in keychain, not shown).
+    RawConfig,
 }
 
 impl SettingsCategory {
-    pub const ALL: [SettingsCategory; 9] = [
+    pub const ALL: [SettingsCategory; 10] = [
         SettingsCategory::Overview,
         SettingsCategory::Identities,
         SettingsCategory::Clouds,
@@ -88,6 +90,7 @@ impl SettingsCategory {
         SettingsCategory::Agent,
         SettingsCategory::Ui,
         SettingsCategory::Provider,
+        SettingsCategory::RawConfig,
     ];
 
     pub fn title(self) -> &'static str {
@@ -101,6 +104,7 @@ impl SettingsCategory {
             Self::Agent => "Agent controls",
             Self::Ui => "Appearance",
             Self::Provider => "Provider",
+            Self::RawConfig => "Raw config",
         }
     }
 
@@ -114,7 +118,8 @@ impl SettingsCategory {
             Self::Install => "How the agent handles missing CLIs",
             Self::Agent => "Mode, thinking, context compaction",
             Self::Ui => "What the chat UI shows",
-            Self::Provider => "LLM provider and model",
+            Self::Provider => "LLM provider and model (opens dedicated Providers UI)",
+            Self::RawConfig => "View effective ~/.config/oscar/config.toml (TOML; no secrets)",
         }
     }
 }
@@ -167,10 +172,19 @@ pub struct SettingsPane {
     pub pending_action: Option<SettingsAction>,
     /// Focus: category column vs item column (arrow drill-in).
     pub focus: SettingsFocus,
+    /// Path to user config.toml (for raw view header).
+    pub config_path: std::path::PathBuf,
+    /// Scroll offset for raw TOML viewer (line-based).
+    pub raw_scroll: usize,
 }
 
 impl SettingsPane {
     pub fn open(config: OscarConfig, catalog: Vec<ToolCatalogEntry>) -> Self {
+        let config_path = oscar_core::Paths::discover()
+            .map(|p| p.config_file)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from("~/.config/oscar/config.toml")
+            });
         Self {
             config,
             catalog,
@@ -184,6 +198,8 @@ impl SettingsPane {
             ),
             pending_action: None,
             focus: SettingsFocus::Categories,
+            config_path,
+            raw_scroll: 0,
         }
     }
 
@@ -209,6 +225,12 @@ impl SettingsPane {
     pub fn drill_in(&mut self) {
         self.focus = SettingsFocus::Items;
         self.ensure_item_bounds();
+        if self.category() == SettingsCategory::RawConfig {
+            self.flash = Some(
+                "Raw config — ↑↓/PgUp/PgDn scroll · Home/End · ← back · Esc close".into(),
+            );
+            return;
+        }
         // Skip headers
         let items = self.items();
         if matches!(
@@ -249,7 +271,89 @@ impl SettingsPane {
             SettingsCategory::Agent => self.items_agent(),
             SettingsCategory::Ui => self.items_ui(),
             SettingsCategory::Provider => self.items_provider(),
+            SettingsCategory::RawConfig => self.items_raw_config(),
         }
+    }
+
+    /// Serialize the **effective in-memory** config as pretty TOML (what Esc will save).
+    /// API keys live in the OS keychain and are never written into this TOML.
+    pub fn raw_toml(&self) -> String {
+        self.config.to_toml_pretty()
+    }
+
+    /// On-disk file contents if present (may lag behind unsaved in-memory edits).
+    pub fn disk_toml(&self) -> Option<String> {
+        std::fs::read_to_string(&self.config_path).ok()
+    }
+
+    /// Status line for the raw TOML viewer header.
+    pub fn raw_status_line(&self) -> String {
+        let raw = self.raw_toml();
+        let lines = raw.lines().count();
+        let disk_note = if self.disk_toml().as_ref() == Some(&raw) {
+            "matches disk"
+        } else if self.config_path.exists() {
+            "in-memory differs from disk (Esc saves)"
+        } else {
+            "file not created yet (Esc saves)"
+        };
+        format!(
+            "{} · {lines} lines · {disk_note} · secrets in keychain only",
+            self.config_path.display()
+        )
+    }
+
+    /// Scroll the raw TOML viewer. `visible_rows` is the viewport height in lines.
+    pub fn scroll_raw(&mut self, delta: i32, visible_rows: usize) {
+        let total = self.raw_toml().lines().count();
+        let max_scroll = total.saturating_sub(visible_rows.max(1));
+        let next = self.raw_scroll as i32 + delta;
+        self.raw_scroll = next.clamp(0, max_scroll as i32) as usize;
+    }
+
+    pub fn scroll_raw_home(&mut self) {
+        self.raw_scroll = 0;
+    }
+
+    pub fn scroll_raw_end(&mut self, visible_rows: usize) {
+        let total = self.raw_toml().lines().count();
+        self.raw_scroll = total.saturating_sub(visible_rows.max(1));
+    }
+
+    /// Meta rows kept for list fallback; the modal draws the full TOML viewer instead.
+    fn items_raw_config(&self) -> Vec<SettingsItem> {
+        let path = self.config_path.display().to_string();
+        let status = self.raw_status_line();
+        vec![
+            SettingsItem {
+                id: "hdr".into(),
+                label: "Raw config (TOML)".into(),
+                description: "Effective settings · secrets are NOT stored here (OS keychain only)"
+                    .into(),
+                kind: ItemKind::Header,
+            },
+            SettingsItem {
+                id: "path".into(),
+                label: "Path".into(),
+                description: path.clone(),
+                kind: ItemKind::Info { value: path },
+            },
+            SettingsItem {
+                id: "status".into(),
+                label: "Status".into(),
+                description: status.clone(),
+                kind: ItemKind::Info { value: status },
+            },
+            SettingsItem {
+                id: "hint".into(),
+                label: "Viewer".into(),
+                description: "→ focus · ↑↓ / PgUp/PgDn scroll · Home/End · keys never in TOML"
+                    .into(),
+                kind: ItemKind::Info {
+                    value: "scrollable TOML body".into(),
+                },
+            },
+        ]
     }
 
     /// G6 — MCP master switch + per-server enable (Code Mode mount).
@@ -466,6 +570,15 @@ impl SettingsPane {
                     } else {
                         "off".into()
                     },
+                },
+            },
+            SettingsItem {
+                id: "raw".into(),
+                label: "Raw config.toml".into(),
+                description: "Open the Raw config category (last tab) for full effective TOML"
+                    .into(),
+                kind: ItemKind::Info {
+                    value: "no secrets".into(),
                 },
             },
             SettingsItem {
@@ -817,6 +930,7 @@ impl SettingsPane {
         self.category_idx = i as usize;
         self.item_idx = 0;
         self.item_scroll = 0;
+        self.raw_scroll = 0;
         self.focus = SettingsFocus::Categories;
         self.flash = Some(self.category().hint().into());
     }

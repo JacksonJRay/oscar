@@ -12,6 +12,10 @@ Release artifacts (Linux) are attached to GitHub Releases:
 
 ## [Unreleased]
 
+### Added
+
+- **Settings → Raw config:** scrollable effective `config.toml` TOML viewer (path + disk/in-memory status; API keys never appear — keychain only)
+
 ### Planned
 
 - apt packages

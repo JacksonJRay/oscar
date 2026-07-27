@@ -465,6 +465,12 @@ impl OscarConfig {
         }
     }
 
+    /// Pretty-print the effective in-memory config as TOML (same shape as `save`).
+    /// Secrets (API keys) are never part of `OscarConfig` — they live in the OS keychain.
+    pub fn to_toml_pretty(&self) -> String {
+        toml::to_string_pretty(self).unwrap_or_else(|e| format!("# serialize config failed: {e}\n"))
+    }
+
     /// Persist **user** config only (never writes project `.oscar/config.toml`).
     pub fn save(&self, paths: &Paths) -> OscarResult<()> {
         paths.ensure()?;

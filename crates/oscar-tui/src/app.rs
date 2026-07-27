@@ -1269,13 +1269,23 @@ impl App {
                 self.apply_config(cfg.clone());
                 self.pending_config_save = Some(cfg);
             }
-            // ↑↓ — move within focused column
+            // ↑↓ — move within focused column (raw config scrolls TOML)
             KeyCode::Up | KeyCode::Char('k') => match pane.focus {
                 SettingsFocus::Categories => pane.move_category(-1),
+                SettingsFocus::Items
+                    if pane.category() == crate::settings::SettingsCategory::RawConfig =>
+                {
+                    pane.scroll_raw(-1, 20);
+                }
                 SettingsFocus::Items => pane.move_item(-1),
             },
             KeyCode::Down | KeyCode::Char('j') => match pane.focus {
                 SettingsFocus::Categories => pane.move_category(1),
+                SettingsFocus::Items
+                    if pane.category() == crate::settings::SettingsCategory::RawConfig =>
+                {
+                    pane.scroll_raw(1, 20);
+                }
                 SettingsFocus::Items => pane.move_item(1),
             },
             // → drill into menu · ← drill out
@@ -1287,6 +1297,8 @@ impl App {
                         return;
                     }
                     pane.drill_in();
+                } else if pane.category() == crate::settings::SettingsCategory::RawConfig {
+                    // Already in raw viewer — no enum cycle
                 } else {
                     // In items: Right cycles enums / toggles forward
                     pane.activate();
@@ -1313,53 +1325,98 @@ impl App {
                 let _ = pane.drill_out();
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
+                if pane.category() == crate::settings::SettingsCategory::RawConfig
+                    && pane.focus == SettingsFocus::Categories
+                {
+                    pane.drill_in();
+                    return;
+                }
+                if pane.category() == crate::settings::SettingsCategory::RawConfig {
+                    return; // no toggles in raw viewer
+                }
                 pane.activate();
                 self.handle_settings_action();
                 return;
             }
             KeyCode::Char('[') => {
-                if pane.focus == SettingsFocus::Items {
+                if pane.focus == SettingsFocus::Items
+                    && pane.category() != crate::settings::SettingsCategory::RawConfig
+                {
                     pane.activate_back();
                 }
             }
             KeyCode::Char(']') => {
-                if pane.focus == SettingsFocus::Items {
+                if pane.focus == SettingsFocus::Items
+                    && pane.category() != crate::settings::SettingsCategory::RawConfig
+                {
                     pane.activate();
                     self.handle_settings_action();
                     return;
                 }
             }
             KeyCode::PageUp => {
-                for _ in 0..10 {
-                    match pane.focus {
-                        SettingsFocus::Categories => pane.move_category(-1),
-                        SettingsFocus::Items => pane.move_item(-1),
+                match pane.focus {
+                    SettingsFocus::Categories => {
+                        for _ in 0..10 {
+                            pane.move_category(-1);
+                        }
+                    }
+                    SettingsFocus::Items
+                        if pane.category() == crate::settings::SettingsCategory::RawConfig =>
+                    {
+                        pane.scroll_raw(-10, 20);
+                    }
+                    SettingsFocus::Items => {
+                        for _ in 0..10 {
+                            pane.move_item(-1);
+                        }
                     }
                 }
             }
             KeyCode::PageDown => {
-                for _ in 0..10 {
-                    match pane.focus {
-                        SettingsFocus::Categories => pane.move_category(1),
-                        SettingsFocus::Items => pane.move_item(1),
+                match pane.focus {
+                    SettingsFocus::Categories => {
+                        for _ in 0..10 {
+                            pane.move_category(1);
+                        }
+                    }
+                    SettingsFocus::Items
+                        if pane.category() == crate::settings::SettingsCategory::RawConfig =>
+                    {
+                        pane.scroll_raw(10, 20);
+                    }
+                    SettingsFocus::Items => {
+                        for _ in 0..10 {
+                            pane.move_item(1);
+                        }
                     }
                 }
             }
             KeyCode::Home => {
                 if pane.focus == SettingsFocus::Items {
-                    pane.item_idx = 0;
+                    if pane.category() == crate::settings::SettingsCategory::RawConfig {
+                        pane.scroll_raw_home();
+                    } else {
+                        pane.item_idx = 0;
+                    }
                 } else {
                     pane.category_idx = 0;
+                    pane.raw_scroll = 0;
                 }
             }
             KeyCode::End => {
                 if pane.focus == SettingsFocus::Items {
-                    let n = pane.items().len();
-                    if n > 0 {
-                        pane.item_idx = n - 1;
+                    if pane.category() == crate::settings::SettingsCategory::RawConfig {
+                        pane.scroll_raw_end(20);
+                    } else {
+                        let n = pane.items().len();
+                        if n > 0 {
+                            pane.item_idx = n - 1;
+                        }
                     }
                 } else {
                     pane.category_idx = crate::settings::SettingsCategory::ALL.len() - 1;
+                    pane.raw_scroll = 0;
                 }
             }
             // number keys jump categories 1-9
@@ -1369,6 +1426,7 @@ impl App {
                     pane.category_idx = idx;
                     pane.item_idx = 0;
                     pane.item_scroll = 0;
+                    pane.raw_scroll = 0;
                     pane.focus = SettingsFocus::Categories;
                     pane.flash = Some(pane.category().hint().into());
                 }

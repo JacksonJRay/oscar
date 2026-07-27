@@ -450,7 +450,11 @@ fn draw_settings_modal(f: &mut Frame, area: Rect, pane: &SettingsPane) {
         .split(body[1]);
 
     draw_categories(f, cols[0], pane);
-    draw_items(f, cols[1], pane);
+    if pane.category() == SettingsCategory::RawConfig {
+        draw_raw_config(f, cols[1], pane);
+    } else {
+        draw_items(f, cols[1], pane);
+    }
 
     // Footer legend
     let legend = match pane.category() {
@@ -466,6 +470,9 @@ fn draw_settings_modal(f: &mut Frame, area: Rect, pane: &SettingsPane) {
         SettingsCategory::Agent => " ↑↓ · → open · mode gate + compaction (readonly default) ",
         SettingsCategory::Provider => {
             " Provider: xAI/OpenCode = browser sign-in · OpenAI/Claude = API key · chat blocked until ready "
+        }
+        SettingsCategory::RawConfig => {
+            " Raw config: → focus · ↑↓/PgUp/PgDn scroll · Home/End · secrets stay in keychain "
         }
         _ => " ↑↓ move · →/Enter open · ← back · Esc close · ~/.config/oscar/config.toml ",
     };
@@ -573,6 +580,93 @@ fn draw_items(f: &mut Frame, area: Rect, pane: &SettingsPane) {
             .border_style(Style::default().fg(border)),
     );
     f.render_widget(list, area);
+}
+
+/// Full TOML dump of effective config (no secrets — those stay in the keychain).
+fn draw_raw_config(f: &mut Frame, area: Rect, pane: &SettingsPane) {
+    use crate::settings::SettingsFocus;
+    let focus_here = pane.focus == SettingsFocus::Items;
+    let border = if focus_here {
+        Color::White
+    } else {
+        Color::DarkGray
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3)])
+        .split(area);
+
+    let status = pane.raw_status_line();
+    let total_lines = pane.raw_toml().lines().count().max(1);
+    let body_h = chunks[1].height.saturating_sub(2) as usize;
+    let max_scroll = total_lines.saturating_sub(body_h.max(1));
+    let scroll = pane.raw_scroll.min(max_scroll);
+    let end = (scroll + body_h).min(total_lines);
+    let title = if focus_here {
+        format!(" raw TOML · focused · lines {}–{end}/{total_lines} · ← back ", scroll + 1)
+    } else {
+        format!(" raw TOML · → focus · lines {}–{end}/{total_lines} ", scroll + 1)
+    };
+
+    f.render_widget(
+        Paragraph::new(status)
+            .style(Style::default().fg(Color::DarkGray))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" path / status ")
+                    .border_style(Style::default().fg(border)),
+            )
+            .wrap(Wrap { trim: true }),
+        chunks[0],
+    );
+
+    let raw = pane.raw_toml();
+    let mut text_lines: Vec<Line> = Vec::new();
+    for (i, line) in raw.lines().enumerate() {
+        if i < scroll {
+            continue;
+        }
+        if text_lines.len() >= body_h {
+            break;
+        }
+        let ln = i + 1;
+        let is_comment = line.trim_start().starts_with('#');
+        let is_header = line.trim_start().starts_with('[') && line.contains(']');
+        let num_style = Style::default().fg(Color::DarkGray);
+        let line_style = if is_header {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if is_comment {
+            Style::default().fg(Color::DarkGray)
+        } else if focus_here {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        text_lines.push(Line::from(vec![
+            Span::styled(format!("{ln:>4} │ "), num_style),
+            Span::styled(line.to_string(), line_style),
+        ]));
+    }
+    if text_lines.is_empty() {
+        text_lines.push(Line::from(Span::styled(
+            "(empty config — defaults will be written on save)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    f.render_widget(
+        Paragraph::new(text_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(border)),
+        ),
+        chunks[1],
+    );
 }
 
 fn format_item_row(item: &crate::settings::SettingsItem, selected: bool) -> String {
