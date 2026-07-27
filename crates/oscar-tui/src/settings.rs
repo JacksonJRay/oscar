@@ -1,9 +1,59 @@
 //! Interactive settings pane inspired by Grok Build `/settings`.
 //!
-//! Left: categories · Right: items · Enter/Space toggle · ←→ cycle enums · Esc save & close
+//! **Arrow navigation (drill in/out):**
+//! - ↑↓ move within the focused column
+//! - → / Enter on categories drills into items
+//! - ← / Esc on items returns to categories
+//! - Enter/Space on items toggles or runs an action
+//! - Esc on categories closes settings
 
 use oscar_core::config::{InstallBinariesPolicy, OscarConfig, ToolsSettings};
 use oscar_core::{ExecutionMode, ThinkingConfig};
+
+/// Which column has keyboard focus in settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsFocus {
+    #[default]
+    Categories,
+    Items,
+}
+
+/// How the user authenticates an LLM provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAuthMode {
+    /// Paste API key only (OpenAI, Anthropic/Claude).
+    ApiKey,
+    /// Sign in with account in browser, then store key from console (xAI, OpenCode).
+    AccountSignIn,
+}
+
+impl ProviderAuthMode {
+    pub fn for_provider(id: &str) -> Self {
+        match id {
+            "openai" | "anthropic" | "claude" => Self::ApiKey,
+            "xai" | "grok" | "opencode-zen" | "zen" | "opencode-go" | "go" => Self::AccountSignIn,
+            _ => Self::ApiKey,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ApiKey => "API key",
+            Self::AccountSignIn => "Account sign-in + key",
+        }
+    }
+}
+
+/// Browser page to open for account sign-in / key creation.
+pub fn provider_auth_url(id: &str) -> &'static str {
+    match id {
+        "xai" | "grok" => "https://console.x.ai/",
+        "opencode-zen" | "zen" | "opencode-go" | "go" => "https://opencode.ai/auth",
+        "openai" => "https://platform.openai.com/api-keys",
+        "anthropic" | "claude" => "https://console.anthropic.com/settings/keys",
+        _ => "https://console.x.ai/",
+    }
+}
 
 /// Catalog row for first-class tool toggles.
 #[derive(Debug, Clone)]
@@ -97,6 +147,8 @@ pub struct SettingsItem {
 pub enum SettingsAction {
     /// Close settings and open secure paste for the selected LLM provider key.
     PasteProviderApiKey { provider_id: String },
+    /// Open browser for account sign-in (xAI / OpenCode), then secure-paste key from console.
+    SignInProvider { provider_id: String },
 }
 
 /// Live settings editor state (modal overlay).
@@ -113,6 +165,8 @@ pub struct SettingsPane {
     pub flash: Option<String>,
     /// One-shot action for the host App (e.g. open secure API-key paste).
     pub pending_action: Option<SettingsAction>,
+    /// Focus: category column vs item column (arrow drill-in).
+    pub focus: SettingsFocus,
 }
 
 impl SettingsPane {
@@ -125,8 +179,11 @@ impl SettingsPane {
             dirty: false,
             tool_filter: String::new(),
             item_scroll: 0,
-            flash: Some("↑↓ navigate · ←→ category · Enter/Space toggle · Esc save & close".into()),
+            flash: Some(
+                "↑↓ move · →/Enter open menu · ← back · Enter toggle · Esc close".into(),
+            ),
             pending_action: None,
+            focus: SettingsFocus::Categories,
         }
     }
 
@@ -137,16 +194,44 @@ impl SettingsPane {
             .iter()
             .position(|c| *c == SettingsCategory::Provider)
             .unwrap_or(0);
-        pane.item_idx = 1; // "Provider" enum row (after header)
+        pane.focus = SettingsFocus::Items;
+        pane.item_idx = 1; // Provider enum
         pane.flash = Some(
-            "Set up LLM provider: ←→ choose provider · ↓ to «Paste API key» · Enter · Esc saves"
-                .into(),
+            "Provider setup: ↑↓ choose · Enter auth action · ← back · Esc close".into(),
         );
         pane
     }
 
     pub fn take_action(&mut self) -> Option<SettingsAction> {
         self.pending_action.take()
+    }
+
+    pub fn drill_in(&mut self) {
+        self.focus = SettingsFocus::Items;
+        self.ensure_item_bounds();
+        // Skip headers
+        let items = self.items();
+        if matches!(
+            items.get(self.item_idx).map(|i| &i.kind),
+            Some(ItemKind::Header)
+        ) {
+            self.move_item(1);
+        }
+        self.flash = Some(format!(
+            "{} — ↑↓ items · ← back · Enter activate",
+            self.category().title()
+        ));
+    }
+
+    /// Returns true if focus moved to categories (caller may close on second Esc).
+    pub fn drill_out(&mut self) -> bool {
+        if self.focus == SettingsFocus::Items {
+            self.focus = SettingsFocus::Categories;
+            self.flash = Some("↑↓ categories · → open · Esc close".into());
+            false
+        } else {
+            true // already on categories — close
+        }
     }
 
     pub fn category(&self) -> SettingsCategory {
@@ -602,80 +687,116 @@ impl SettingsPane {
             .iter()
             .position(|p| *p == self.config.provider.id)
             .unwrap_or(0);
-        let key_present = oscar_identity::load_provider_api_key(&self.config.provider.id)
+        let pid = self.config.provider.id.as_str();
+        let auth_mode = ProviderAuthMode::for_provider(pid);
+        let key_present = oscar_identity::load_provider_api_key(pid)
             .ok()
             .flatten()
             .map(|k| !k.is_empty())
             .unwrap_or(false);
-        vec![
+        let mut items = vec![
             SettingsItem {
                 id: "hdr".into(),
                 label: "LLM provider".into(),
-                description: "Keys stored in OS keychain (never in chat). Select provider then paste key.".into(),
+                description: "xAI/OpenCode: sign in with account · OpenAI/Claude: API key. Secrets never enter chat.".into(),
                 kind: ItemKind::Header,
             },
             SettingsItem {
                 id: "provider_id".into(),
                 label: "Provider".into(),
-                description: "←→ cycle · xai / openai / anthropic / opencode-zen / opencode-go".into(),
+                description: "↑↓ focus · Enter/→ open actions · cycle with [/] when selected".into(),
                 kind: ItemKind::Enum {
                     options: providers.to_vec(),
                     index: idx,
                 },
             },
             SettingsItem {
-                id: "paste_provider_key".into(),
-                label: if key_present {
-                    "Paste / replace API key"
-                } else {
-                    "Paste API key (required)"
-                }
-                .into(),
-                description: "Enter opens secure bar — agent never sees the value".into(),
-                kind: ItemKind::Toggle {
-                    // Not a real toggle — activate() treats this id specially.
-                    on: key_present,
+                id: "auth_mode".into(),
+                label: "Auth method".into(),
+                description: "How this provider expects you to connect".into(),
+                kind: ItemKind::Info {
+                    value: auth_mode.label().into(),
                 },
             },
-            SettingsItem {
-                id: "key_status".into(),
-                label: "Keychain status".into(),
-                description: "Whether a key is stored for the selected provider".into(),
-                kind: ItemKind::Info {
-                    value: if key_present {
-                        format!("key present for `{}`", self.config.provider.id)
+        ];
+        match auth_mode {
+            ProviderAuthMode::AccountSignIn => {
+                items.push(SettingsItem {
+                    id: "signin_provider".into(),
+                    label: if key_present {
+                        "Sign in again (browser)".into()
                     } else {
-                        format!("NO KEY for `{}` — paste required", self.config.provider.id)
+                        "Sign in with account (browser)".into()
                     },
+                    description: format!(
+                        "Opens {} — sign in, create/copy key, then paste below",
+                        provider_auth_url(pid)
+                    ),
+                    kind: ItemKind::Toggle { on: key_present },
+                });
+                items.push(SettingsItem {
+                    id: "paste_provider_key".into(),
+                    label: if key_present {
+                        "Paste / replace API key from console".into()
+                    } else {
+                        "Paste API key (after sign-in)".into()
+                    },
+                    description: "Secure bar — agent never sees the value".into(),
+                    kind: ItemKind::Toggle { on: key_present },
+                });
+            }
+            ProviderAuthMode::ApiKey => {
+                items.push(SettingsItem {
+                    id: "paste_provider_key".into(),
+                    label: if key_present {
+                        "Paste / replace API key".into()
+                    } else {
+                        "Paste API key (required)".into()
+                    },
+                    description: "OpenAI / Claude use API keys only — secure bar, never chat".into(),
+                    kind: ItemKind::Toggle { on: key_present },
+                });
+            }
+        }
+        items.push(SettingsItem {
+            id: "key_status".into(),
+            label: "Keychain status".into(),
+            description: "Whether a key is stored for the selected provider".into(),
+            kind: ItemKind::Info {
+                value: if key_present {
+                    format!("ready — key present for `{pid}`")
+                } else {
+                    format!("NOT READY — auth required for `{pid}`")
                 },
             },
-            SettingsItem {
-                id: "model".into(),
-                label: "Model".into(),
-                description: "Configured model id (edit config.toml for custom ids)".into(),
-                kind: ItemKind::Info {
-                    value: self
-                        .config
-                        .provider
-                        .model
-                        .clone()
-                        .unwrap_or_else(|| "(provider default)".into()),
-                },
+        });
+        items.push(SettingsItem {
+            id: "model".into(),
+            label: "Model".into(),
+            description: "Configured model id (edit config.toml for custom ids)".into(),
+            kind: ItemKind::Info {
+                value: self
+                    .config
+                    .provider
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "(provider default)".into()),
             },
-            SettingsItem {
-                id: "base".into(),
-                label: "Base URL".into(),
-                description: "Optional custom OpenAI-compatible endpoint".into(),
-                kind: ItemKind::Info {
-                    value: self
-                        .config
-                        .provider
-                        .base_url
-                        .clone()
-                        .unwrap_or_else(|| "(default)".into()),
-                },
+        });
+        items.push(SettingsItem {
+            id: "base".into(),
+            label: "Base URL".into(),
+            description: "Optional custom OpenAI-compatible endpoint".into(),
+            kind: ItemKind::Info {
+                value: self
+                    .config
+                    .provider
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "(default)".into()),
             },
-        ]
+        });
+        items
     }
 
     pub fn ensure_item_bounds(&mut self) {
@@ -696,6 +817,7 @@ impl SettingsPane {
         self.category_idx = i as usize;
         self.item_idx = 0;
         self.item_scroll = 0;
+        self.focus = SettingsFocus::Categories;
         self.flash = Some(self.category().hint().into());
     }
 
@@ -726,6 +848,10 @@ impl SettingsPane {
 
     /// Activate selected item (toggle / cycle forward / action).
     pub fn activate(&mut self) {
+        if self.focus == SettingsFocus::Categories {
+            self.drill_in();
+            return;
+        }
         let items = self.items();
         if let Some(item) = items.get(self.item_idx) {
             if item.id == "paste_provider_key" {
@@ -738,7 +864,18 @@ impl SettingsPane {
                 ));
                 return;
             }
+            if item.id == "signin_provider" {
+                self.pending_action = Some(SettingsAction::SignInProvider {
+                    provider_id: self.config.provider.id.clone(),
+                });
+                self.flash = Some(format!(
+                    "Opening browser sign-in for `{}`…",
+                    self.config.provider.id
+                ));
+                return;
+            }
         }
+        // Enums: cycle on Enter when focused on items
         self.apply_delta(1);
     }
 

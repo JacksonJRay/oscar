@@ -186,10 +186,14 @@ impl App {
     /// Open Settings → Provider (used on first run / missing key).
     pub fn open_provider_setup(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
+        // Never leave chat stuck in streaming when forcing setup.
+        self.streaming = false;
+        self.activity = AgentActivity::Idle;
+        self.cancel_requested = false;
         self.push_line(LineKind::System, reason);
         self.push_line(
             LineKind::System,
-            "Provider setup: ←→ choose provider · ↓ «Paste API key» · Enter · key goes to OS keychain (agent never sees it).",
+            "Provider setup: ↑↓ move · → open · Enter auth · xAI/OpenCode = browser sign-in · OpenAI/Claude = API key. Chat is disabled until ready.",
         );
         let pane = SettingsPane::open_provider(
             self.config.oscar_config.clone(),
@@ -927,14 +931,39 @@ impl App {
             return;
         }
 
+        // Cancel works even when stuck: Esc / Ctrl+C while streaming (or fake-streaming).
         if self.streaming
             && (key.code == KeyCode::Esc
                 || (key.modifiers.contains(KeyModifiers::CONTROL)
                     && key.code == KeyCode::Char('c')))
         {
             self.cancel_requested = true;
-            self.push_line(LineKind::System, "Cancel requested…");
+            self.streaming = false;
+            self.activity = AgentActivity::Idle;
+            self.push_line(LineKind::System, "Cancel requested — stopping generation…");
             return;
+        }
+        // Block almost all chat interaction until a provider is ready (except setup shortcuts).
+        if !self.config.provider_ready
+            && matches!(self.view, View::Chat)
+            && matches!(self.input_mode, InputMode::Normal)
+        {
+            let is_setup = matches!(
+                key.code,
+                KeyCode::Char(',') | KeyCode::Char('i')
+            ) && key.modifiers.contains(KeyModifiers::CONTROL);
+            let is_help_or_quit = matches!(key.code, KeyCode::Esc)
+                || (key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('c')));
+            // Allow typing so user can type /provider; still intercept plain Enter without /.
+            // Provider setup already auto-opened; keep Esc from quitting immediately if they need setup.
+            if key.code == KeyCode::Esc && !is_help_or_quit {
+                self.open_provider_setup(
+                    "Chat is disabled until an LLM provider is ready. Use Provider setup.",
+                );
+                return;
+            }
+            let _ = is_setup;
         }
 
         // Input bar chords (work in normal + secure modes)
@@ -1193,14 +1222,18 @@ impl App {
     }
 
     fn on_settings_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crate::settings::SettingsFocus;
+
         let View::Settings(ref mut pane) = self.view else {
             return;
         };
 
         match key.code {
             KeyCode::Esc => {
-                // save by default (Grok-like: leave persists)
-                self.close_settings(true);
+                // Drill out of items first; second Esc (or Esc on categories) closes.
+                if pane.drill_out() {
+                    self.close_settings(true);
+                }
             }
             KeyCode::Char('q') if key.modifiers.is_empty() => {
                 self.close_settings(true);
@@ -1213,67 +1246,102 @@ impl App {
                 self.apply_config(cfg.clone());
                 self.pending_config_save = Some(cfg);
             }
-            KeyCode::Left | KeyCode::Char('h') => {
-                pane.move_category(-1);
-            }
+            // ↑↓ — move within focused column
+            KeyCode::Up | KeyCode::Char('k') => match pane.focus {
+                SettingsFocus::Categories => pane.move_category(-1),
+                SettingsFocus::Items => pane.move_item(-1),
+            },
+            KeyCode::Down | KeyCode::Char('j') => match pane.focus {
+                SettingsFocus::Categories => pane.move_category(1),
+                SettingsFocus::Items => pane.move_item(1),
+            },
+            // → drill into menu · ← drill out
             KeyCode::Right | KeyCode::Char('l') => {
-                pane.move_category(1);
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                pane.move_item(-1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                pane.move_item(1);
-            }
-            KeyCode::Tab => {
-                pane.move_category(1);
-            }
-            KeyCode::BackTab => {
-                pane.move_category(-1);
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                pane.activate();
-                if let Some(crate::settings::SettingsAction::PasteProviderApiKey { provider_id }) =
-                    pane.take_action()
-                {
-                    // Persist provider selection then open secure paste.
-                    self.close_settings(true);
-                    self.begin_provider_key_paste(provider_id);
+                if pane.focus == SettingsFocus::Categories {
+                    pane.drill_in();
+                } else {
+                    // In items: Right cycles enums / toggles forward
+                    pane.activate();
+                    self.handle_settings_action();
                     return;
                 }
             }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if pane.focus == SettingsFocus::Items {
+                    let _ = pane.drill_out();
+                } else {
+                    // On categories: Left also steps previous category
+                    pane.move_category(-1);
+                }
+            }
+            KeyCode::Tab => {
+                if pane.focus == SettingsFocus::Categories {
+                    pane.drill_in();
+                } else {
+                    let _ = pane.drill_out();
+                }
+            }
+            KeyCode::BackTab => {
+                let _ = pane.drill_out();
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                pane.activate();
+                self.handle_settings_action();
+                return;
+            }
             KeyCode::Char('[') => {
-                pane.activate_back();
+                if pane.focus == SettingsFocus::Items {
+                    pane.activate_back();
+                }
             }
             KeyCode::Char(']') => {
-                pane.activate();
+                if pane.focus == SettingsFocus::Items {
+                    pane.activate();
+                    self.handle_settings_action();
+                    return;
+                }
             }
             KeyCode::PageUp => {
                 for _ in 0..10 {
-                    pane.move_item(-1);
+                    match pane.focus {
+                        SettingsFocus::Categories => pane.move_category(-1),
+                        SettingsFocus::Items => pane.move_item(-1),
+                    }
                 }
             }
             KeyCode::PageDown => {
                 for _ in 0..10 {
-                    pane.move_item(1);
+                    match pane.focus {
+                        SettingsFocus::Categories => pane.move_category(1),
+                        SettingsFocus::Items => pane.move_item(1),
+                    }
                 }
             }
             KeyCode::Home => {
-                pane.item_idx = 0;
-            }
-            KeyCode::End => {
-                let n = pane.items().len();
-                if n > 0 {
-                    pane.item_idx = n - 1;
+                if pane.focus == SettingsFocus::Items {
+                    pane.item_idx = 0;
+                } else {
+                    pane.category_idx = 0;
                 }
             }
-            // number keys jump categories 1-8
-            KeyCode::Char(c @ '1'..='8') => {
+            KeyCode::End => {
+                if pane.focus == SettingsFocus::Items {
+                    let n = pane.items().len();
+                    if n > 0 {
+                        pane.item_idx = n - 1;
+                    }
+                } else {
+                    pane.category_idx = crate::settings::SettingsCategory::ALL.len() - 1;
+                }
+            }
+            // number keys jump categories 1-9
+            KeyCode::Char(c @ '1'..='9') => {
                 let idx = (c as u8 - b'1') as usize;
                 if idx < crate::settings::SettingsCategory::ALL.len() {
                     pane.category_idx = idx;
                     pane.item_idx = 0;
                     pane.item_scroll = 0;
+                    pane.focus = SettingsFocus::Categories;
                     pane.flash = Some(pane.category().hint().into());
                 }
             }
@@ -1284,6 +1352,41 @@ impl App {
                 return;
             }
             _ => {}
+        }
+    }
+
+    /// Handle one-shot settings actions (provider auth) after activate/drill.
+    fn handle_settings_action(&mut self) {
+        use crate::settings::{provider_auth_url, SettingsAction};
+        let action = match &mut self.view {
+            View::Settings(pane) => pane.take_action(),
+            _ => None,
+        };
+        match action {
+            Some(SettingsAction::PasteProviderApiKey { provider_id }) => {
+                self.close_settings(true);
+                self.begin_provider_key_paste(provider_id);
+            }
+            Some(SettingsAction::SignInProvider { provider_id }) => {
+                let url = provider_auth_url(&provider_id);
+                // Best-effort open browser for account sign-in.
+                let opened = open_browser_url(url);
+                self.close_settings(true);
+                self.push_line(
+                    LineKind::System,
+                    if opened {
+                        format!(
+                            "Opened browser for `{provider_id}` sign-in ({url}). After you sign in and copy a key from the console, paste it in the secure bar."
+                        )
+                    } else {
+                        format!(
+                            "Open this URL in your browser to sign in to `{provider_id}`: {url} — then paste the console API key in the secure bar."
+                        )
+                    },
+                );
+                self.begin_provider_key_paste(provider_id);
+            }
+            None => {}
         }
     }
 
@@ -1365,6 +1468,27 @@ fn truncate_str(s: &str, max: usize) -> String {
         format!("{}…", t.chars().take(max).collect::<String>())
     } else {
         t.to_string()
+    }
+}
+
+/// Best-effort open URL in the user browser (account sign-in for xAI / OpenCode).
+fn open_browser_url(url: &str) -> bool {
+    use std::process::Command;
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(url).spawn().is_ok()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Command::new("xdg-open").arg(url).spawn().is_ok()
+            || Command::new("gio").args(["open", url]).spawn().is_ok()
     }
 }
 
@@ -1452,10 +1576,25 @@ async fn run_loop(
                 || user == "/new"
                 || user.starts_with("/resume")
                 || user.starts_with("/session");
-            let _ = user_tx.send(user).await;
-            // Don't mark streaming for pure slash history commands (host will Done quickly)
-            if !is_history_cmd {
-                app.streaming = true;
+            let is_setup_cmd = user.starts_with("/provider")
+                || user.starts_with("/llm")
+                || user.starts_with("/api-key")
+                || user.starts_with("/apikey")
+                || user.starts_with("/settings")
+                || user == "/help"
+                || user == "/quit"
+                || user == "/exit";
+            // Never stream chat turns when no provider — avoids stuck cancel/streaming bug.
+            if !app.config.provider_ready && !user.starts_with('/') {
+                app.streaming = false;
+                app.open_provider_setup(
+                    "Chat blocked: no LLM provider ready. Sign in / paste a key first.",
+                );
+            } else {
+                let _ = user_tx.send(user).await;
+                if !is_history_cmd && !is_setup_cmd {
+                    app.streaming = true;
+                }
             }
         }
         if app.pending_session_save {

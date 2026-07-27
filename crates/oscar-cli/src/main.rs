@@ -3653,16 +3653,44 @@ async fn run_chat_with_session(
                         if let Ok(store) = ProfileStore::load(&paths) {
                             agent.reload_profiles(Arc::new(store));
                         }
-                        agent.resume_after_auth(event_tx_host.clone(), cancel.clone()).await;
+                        // Allow Esc cancel while resuming after auth
+                        cancel = CancellationToken::new();
+                        {
+                            let resume =
+                                agent.resume_after_auth(event_tx_host.clone(), cancel.clone());
+                            tokio::pin!(resume);
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    Some(()) = cancel_rx.recv() => {
+                                        cancel.cancel();
+                                    }
+                                    _ = &mut resume => break,
+                                }
+                            }
+                        }
                         while let Ok(tr) = transcript_rx.try_recv() {
                             stored.transcript = tr;
                         }
                         persist_chat(&paths, &mut stored, agent, created_at);
                         continue;
                     }
-                    agent
-                        .run_turn(user, event_tx_host.clone(), cancel.clone())
-                        .await;
+                    // Run turn while still listening for cancel (Esc / Ctrl+C in TUI).
+                    cancel = CancellationToken::new();
+                    {
+                        let turn = agent.run_turn(user, event_tx_host.clone(), cancel.clone());
+                        tokio::pin!(turn);
+                        loop {
+                            tokio::select! {
+                                biased;
+                                Some(()) = cancel_rx.recv() => {
+                                    cancel.cancel();
+                                    // Keep waiting until the turn observes cancel and exits.
+                                }
+                                _ = &mut turn => break,
+                            }
+                        }
+                    }
                     // Auto-save after every completed turn (E1 / Grok Build history)
                     while let Ok(tr) = transcript_rx.try_recv() {
                         stored.transcript = tr;

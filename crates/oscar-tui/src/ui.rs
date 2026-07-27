@@ -420,16 +420,19 @@ fn draw_settings_modal(f: &mut Frame, area: Rect, pane: &SettingsPane) {
     // Footer legend
     let legend = match pane.category() {
         SettingsCategory::Clouds => {
-            " Clouds: off removes that CSP from tools_search (e.g. AWS-only shop) "
+            " ↑↓ move · → open · ← back · Clouds: off hides CSP from tools_search "
         }
         SettingsCategory::Tools => {
-            " Tools: disabled ids never return from tools_search / tools_execute "
+            " ↑↓ move · → open · ← back · disabled tools never appear in tools_search "
         }
         SettingsCategory::Install => {
-            " Install: off|recommend|ask-admin|install-all — approve install for elevation "
+            " ↑↓ · → open · Install: off|recommend|ask-admin|install-all "
         }
-        SettingsCategory::Agent => " Agent: mode gate + compaction (readonly default) ",
-        _ => " Config path: ~/.config/oscar/config.toml ",
+        SettingsCategory::Agent => " ↑↓ · → open · mode gate + compaction (readonly default) ",
+        SettingsCategory::Provider => {
+            " Provider: xAI/OpenCode = browser sign-in · OpenAI/Claude = API key · chat blocked until ready "
+        }
+        _ => " ↑↓ move · →/Enter open · ← back · Esc close · ~/.config/oscar/config.toml ",
     };
     f.render_widget(
         Paragraph::new(legend).style(Style::default().fg(Color::DarkGray)),
@@ -438,16 +441,30 @@ fn draw_settings_modal(f: &mut Frame, area: Rect, pane: &SettingsPane) {
 }
 
 fn draw_categories(f: &mut Frame, area: Rect, pane: &SettingsPane) {
+    use crate::settings::SettingsFocus;
+    let focus_here = pane.focus == SettingsFocus::Categories;
     let items: Vec<ListItem> = SettingsCategory::ALL
         .iter()
         .enumerate()
         .map(|(i, c)| {
             let selected = i == pane.category_idx;
-            let prefix = if selected { "▸ " } else { "  " };
-            let style = if selected {
+            let prefix = if selected {
+                if focus_here {
+                    "▸ "
+                } else {
+                    "· "
+                }
+            } else {
+                "  "
+            };
+            let style = if selected && focus_here {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if selected {
+                Style::default()
+                    .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray)
@@ -456,16 +473,23 @@ fn draw_categories(f: &mut Frame, area: Rect, pane: &SettingsPane) {
         })
         .collect();
 
+    let border = if focus_here { Color::Cyan } else { Color::DarkGray };
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" categories ")
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .title(if focus_here {
+                " categories · focused "
+            } else {
+                " categories "
+            })
+            .border_style(Style::default().fg(border)),
     );
     f.render_widget(list, area);
 }
 
 fn draw_items(f: &mut Frame, area: Rect, pane: &SettingsPane) {
+    use crate::settings::SettingsFocus;
+    let focus_here = pane.focus == SettingsFocus::Items;
     let items = pane.items();
     let height = area.height.saturating_sub(2) as usize;
     let mut scroll = pane.item_scroll;
@@ -485,27 +509,33 @@ fn draw_items(f: &mut Frame, area: Rect, pane: &SettingsPane) {
             break;
         }
         let selected = i == pane.item_idx;
-        let row = format_item_row(item, selected);
-        let style = match (&item.kind, selected) {
-            (ItemKind::Header, _) => Style::default()
+        let row = format_item_row(item, selected && focus_here);
+        let style = match (&item.kind, selected, focus_here) {
+            (ItemKind::Header, _, _) => Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-            (_, true) => Style::default()
+            (_, true, true) => Style::default()
                 .fg(Color::Black)
                 .bg(Color::White)
                 .add_modifier(Modifier::BOLD),
-            (ItemKind::Toggle { on: true }, false) => Style::default().fg(Color::Green),
-            (ItemKind::Toggle { on: false }, false) => Style::default().fg(Color::Red),
+            (_, true, false) => Style::default().fg(Color::White),
+            (ItemKind::Toggle { on: true }, false, _) => Style::default().fg(Color::Green),
+            (ItemKind::Toggle { on: false }, false, _) => Style::default().fg(Color::Red),
             _ => Style::default().fg(Color::Gray),
         };
         lines.push(ListItem::new(row).style(style));
     }
 
+    let border = if focus_here { Color::White } else { Color::DarkGray };
     let list = List::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" {} ", pane.category().title()))
-            .border_style(Style::default().fg(Color::Cyan)),
+            .title(if focus_here {
+                format!(" {} · focused · ← back ", pane.category().title())
+            } else {
+                format!(" {} · → open ", pane.category().title())
+            })
+            .border_style(Style::default().fg(border)),
     );
     f.render_widget(list, area);
 }
