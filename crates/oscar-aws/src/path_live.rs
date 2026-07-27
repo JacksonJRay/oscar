@@ -1,6 +1,6 @@
 //! Live AWS path / access analyzer tools via EC2 Network Insights APIs.
 
-use crate::aws_runtime::{aws_json, first_aws_profile};
+use crate::aws_runtime::{aws_json, first_aws_profile_ctx};
 use async_trait::async_trait;
 use oscar_core::{Capability, Cloud, PathBlocker, PathHop, PathStatus, PathTraceResult, ToolDomain};
 use oscar_tools::{Tool, ToolContext, ToolMeta, ToolResult};
@@ -51,8 +51,8 @@ impl Tool for AwsNetworkPathAnalyze {
         if source.is_empty() || dest.is_empty() {
             return ToolResult::error("source and destination are required");
         }
-        let profile = match first_aws_profile(
-            &ctx.profiles,
+        let profile = match first_aws_profile_ctx(
+            ctx,
             args.get("profile_id").and_then(|v| v.as_str()),
         ) {
             Ok(p) => p,
@@ -319,8 +319,8 @@ impl Tool for AwsNetworkAccessAnalyze {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match first_aws_profile(
-            &ctx.profiles,
+        let profile = match first_aws_profile_ctx(
+            ctx,
             args.get("profile_id").and_then(|v| v.as_str()),
         ) {
             Ok(p) => p,

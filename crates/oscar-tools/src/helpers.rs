@@ -16,10 +16,39 @@ pub fn resolve_profiles<'a>(
     cloud: Cloud,
     profile_id: Option<&str>,
 ) -> Vec<&'a Profile> {
+    resolve_profiles_pref(store, cloud, profile_id, None)
+}
+
+/// Resolve profiles for a cloud, honoring explicit id then session preferred profile.
+pub fn resolve_profiles_pref<'a>(
+    store: &'a ProfileStore,
+    cloud: Cloud,
+    profile_id: Option<&str>,
+    preferred_profile_id: Option<&str>,
+) -> Vec<&'a Profile> {
     if let Some(id) = profile_id {
         return store.get(id).into_iter().collect();
     }
+    if let Some(id) = preferred_profile_id {
+        if let Some(p) = store.get(id) {
+            if p.cloud == cloud {
+                return vec![p];
+            }
+        }
+    }
     profiles_for_cloud(store, cloud)
+}
+
+/// Pick one profile for live tools: explicit → preferred → first matching cloud.
+pub fn pick_profile<'a>(
+    store: &'a ProfileStore,
+    cloud: Cloud,
+    profile_id: Option<&str>,
+    preferred_profile_id: Option<&str>,
+) -> Option<&'a Profile> {
+    resolve_profiles_pref(store, cloud, profile_id, preferred_profile_id)
+        .into_iter()
+        .next()
 }
 
 /// Build a standard AuthRequest with CSP-specific kinds and operator hints.

@@ -26,7 +26,7 @@ async fn run_network_pattern(
         Ok(q) => q,
         Err(e) => return ToolResult::error(e),
     };
-    let profiles = resolve_profiles(&ctx.profiles, Cloud::Aws, q.profile_id.as_deref());
+    let profiles = ctx.profiles_for(Cloud::Aws, q.profile_id.as_deref());
     if profiles.is_empty() {
         return ToolResult::needs_auth(auth_for(
             Cloud::Aws,
@@ -121,10 +121,7 @@ impl Tool for AwsNetworkInventorySync {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Aws,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Aws, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(

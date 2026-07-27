@@ -106,8 +106,26 @@ impl ProfileStore {
         self.data.profiles.len() != before
     }
 
-    /// Ensure a profile exists for `cloud` + `label` (or explicit id). Updates account/region when provided.
+    /// Find a profile by cloud + account id (for multi-account pivot).
+    pub fn find_by_account(&self, cloud: Cloud, account_ref: &str) -> Option<&Profile> {
+        let want = account_ref.trim();
+        if want.is_empty()
+            || want.eq_ignore_ascii_case("pending")
+            || want.eq_ignore_ascii_case("unknown")
+        {
+            return None;
+        }
+        self.data
+            .profiles
+            .iter()
+            .find(|p| p.cloud == cloud && p.account_ref.trim() == want)
+    }
+
+    /// Ensure a profile exists for `cloud` + `label` (or explicit id / account). Updates account/region when provided.
     /// Returns `(profile, created)` where `created` is true if a new row was inserted.
+    ///
+    /// Match order: explicit `profile_id` → same cloud+account → cloud+label id → insert new.
+    /// Multiple profiles per cloud are supported (multi-account pivot).
     pub fn ensure_profile(
         &mut self,
         cloud: Cloud,
@@ -134,6 +152,27 @@ impl ProfileStore {
             p.default_region = region;
             self.upsert(p.clone());
             return (p, true);
+        }
+        // Prefer reusing the profile already bound to this account (multi-account).
+        if let Some(existing) = self
+            .data
+            .profiles
+            .iter_mut()
+            .find(|p| {
+                p.cloud == cloud
+                    && !account_ref.is_empty()
+                    && account_ref != "pending"
+                    && account_ref != "unknown"
+                    && p.account_ref.trim() == account_ref.trim()
+            })
+        {
+            if let Some(r) = region {
+                existing.default_region = Some(r);
+            }
+            if existing.label != label && label != "default" {
+                existing.label = label;
+            }
+            return (existing.clone(), false);
         }
         // Match by cloud+label id convention or existing cloud+label
         let provisional = Profile::new(cloud, &label, &account_ref);

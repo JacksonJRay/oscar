@@ -36,6 +36,8 @@ pub fn register_multi(registry: &mut ToolRegistry) {
     registry.register(Arc::new(SystemSkillsGet));
     registry.register(Arc::new(SystemIdentitiesList));
     registry.register(Arc::new(SystemAccessPrepare));
+    registry.register(Arc::new(SystemAccessReview));
+    registry.register(Arc::new(SystemAccessSelect));
     registry.register(Arc::new(SystemProfilesList));
     registry.register(Arc::new(AccessTroubleshootGuide));
     registry.register(Arc::new(AccessPatternFind));
@@ -43,6 +45,8 @@ pub fn register_multi(registry: &mut ToolRegistry) {
 
 struct SystemIdentitiesList;
 struct SystemAccessPrepare;
+struct SystemAccessReview;
+struct SystemAccessSelect;
 struct SystemProfilesList;
 
 struct SystemSkillsList;
@@ -123,7 +127,7 @@ impl Tool for SystemAccessPrepare {
         META.get_or_init(|| ToolMeta {
             id: "system.access.prepare".into(),
             name: "Prepare cloud account access".into(),
-            description: "When the user wants to use a cloud/account (AWS account, GCP project, Azure subscription, or k8s), call this first. Creates or updates local oscar profile metadata under ~/.config/oscar/profiles.toml (no secrets). Returns how to sign in: SSO/browser (aws/gcloud/az), short-lived session keys, or keychain paste via TUI secure bar. Prefer over inventing CLI recipes. Never ask for secrets in chat.".into(),
+            description: "Multi-profile onboarding: when the user wants to troubleshoot a specific cloud account (e.g. AWS account 123…, GCP project, Azure subscription) and oscar lacks access, call this. Creates/updates a dedicated local profile (not single global config) so short-term creds can be stored per account and oscar can pivot later. Sets session preferred profile. User pastes short-term keys in TUI secure bar (agent never sees values) or runs SSO (`oscar auth …`). Use system.access.review to list usable profiles; system.access.select to pivot.".into(),
             domain: ToolDomain::Meta,
             clouds: vec![Cloud::Multi, Cloud::Aws, Cloud::Gcp, Cloud::Azure, Cloud::K8s],
             capability: Capability::Read,
@@ -222,11 +226,22 @@ impl Tool for SystemAccessPrepare {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         let profile_id = args.get("profile_id").and_then(|v| v.as_str());
+        let account_specific = {
+            let a = account.to_ascii_lowercase();
+            !a.is_empty() && a != "pending" && a != "unknown" && a != "ambient"
+        };
         let prefer = args
             .get("prefer")
             .and_then(|v| v.as_str())
             .and_then(AuthPrefer::parse)
-            .unwrap_or(AuthPrefer::BinarySso);
+            .unwrap_or_else(|| {
+                // Multi-account AWS: prefer short-lived keys bound to this profile over ambient SSO.
+                if cloud == Cloud::Aws && account_specific {
+                    AuthPrefer::ShortLived
+                } else {
+                    AuthPrefer::BinarySso
+                }
+            });
         let request_auth = args
             .get("request_auth")
             .and_then(|v| v.as_bool())
@@ -243,6 +258,13 @@ impl Tool for SystemAccessPrepare {
             Ok(s) => s,
             Err(e) => return ToolResult::error(format!("load profiles: {e}")),
         };
+
+        let other_cloud_profiles: Vec<_> = store
+            .list()
+            .iter()
+            .filter(|p| p.cloud == cloud)
+            .map(|p| p.id.clone())
+            .collect();
 
         let (profile, created) =
             store.ensure_profile(cloud, label, account, region.clone(), profile_id);
@@ -281,7 +303,12 @@ impl Tool for SystemAccessPrepare {
 
         let data = json!({
             "reload_profiles": true,
+            "set_preferred_profile": profile.id,
             "created": created,
+            "multi_profile": {
+                "other_profiles_same_cloud": other_cloud_profiles,
+                "note": "Each profile has its own keychain namespace (oscar/<profile_id>/*). Ambient CLI SSO is only reused when it matches this profile's account_ref — otherwise paste short-lived keys for this profile.",
+            },
             "profile": {
                 "id": profile.id,
                 "cloud": profile.cloud.to_string(),
@@ -297,11 +324,19 @@ impl Tool for SystemAccessPrepare {
                 AuthPrefer::LongLived => "keys",
             },
             "auth_model": {
-                "binary_session": "Detected logged-in aws/gcloud/az/kubectl on PATH — preferred, no secrets in oscar keychain",
-                "short_lived_keychain": "STS/session or temp keys under OS keychain namespace oscar/<profile_id>/*",
-                "long_lived_keychain": "Access keys / SA JSON in keychain — use only when SSO/session unavailable",
+                "binary_session": "Logged-in aws/gcloud/az/kubectl — only used if account matches this profile",
+                "short_lived_keychain": "STS/session keys in OS keychain under oscar/<profile_id>/* (recommended for multi-account)",
+                "long_lived_keychain": "Long-lived access keys / SA JSON — last resort",
+                "secure_paste": "TUI secure bar collects secrets field-by-field; values go to keychain only — agent never receives secret material",
                 "never_in_chat": true,
             },
+            "user_message_template": format!(
+                "Please authenticate profile `{}` for {} account `{}`. Prefer short-lived credentials. In the TUI, use the secure input bar (masked) — do not paste keys into chat. Or run: {}",
+                profile.id,
+                cloud,
+                profile.account_ref,
+                auth.hint_commands.first().cloned().unwrap_or_else(|| "oscar auth …".into())
+            ),
             "next_steps": auth.hint_commands,
             "guidance": auth.guidance,
             "cli_equivalent": format!(
@@ -312,11 +347,11 @@ impl Tool for SystemAccessPrepare {
                 region.as_ref().map(|r| format!(" --region {r}")).unwrap_or_default()
             ),
             "after_auth": [
-                "Type `retry` in chat if a tool was waiting, or re-ask the agent",
-                "oscar identities check",
-                "oscar auth aws-test --profile <id>  # AWS",
+                "Host auto-retries paused tools after secure paste / type `retry` after SSO",
+                "system.access.review to see which profiles are usable",
+                "Pass profile_id on tools when pivoting; session preferred profile is set automatically",
             ],
-            "ui": "/identities · secure input bar on auth_required · never paste secrets into chat",
+            "ui": "/identities · SECURE bar (agent-blind) · never paste secrets into chat",
         });
 
         if request_auth {
@@ -336,6 +371,220 @@ impl Tool for SystemAccessPrepare {
         }
 
         ToolResult::success(summary, data)
+    }
+}
+
+#[async_trait]
+impl Tool for SystemAccessReview {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "system.access.review".into(),
+            name: "Review available cloud credentials".into(),
+            description: "List all oscar profiles and ambient sessions with validity (no secret values) so the agent can pivot accounts/CSPs. Filter by cloud or account. Prefer this before troubleshooting when unsure which credentials are available. Does not print keys.".into(),
+            domain: ToolDomain::Meta,
+            clouds: vec![Cloud::Multi, Cloud::Aws, Cloud::Gcp, Cloud::Azure, Cloud::K8s],
+            capability: Capability::Read,
+            tags: vec![
+                "access".into(),
+                "review".into(),
+                "credentials".into(),
+                "profiles".into(),
+                "pivot".into(),
+                "multi-account".into(),
+                "identity".into(),
+                "whoami".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "cloud": { "type": "string", "description": "Optional filter aws|gcp|azure|k8s" },
+                    "account": { "type": "string", "description": "Optional account/project/subscription filter" },
+                    "live": { "type": "boolean", "default": true, "description": "Live-probe validity when true" }
+                }
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        use oscar_identity::{
+            build_identity_inventory, build_identity_inventory_quick, ProfileStore, Validity,
+        };
+        let live = args.get("live").and_then(|v| v.as_bool()).unwrap_or(true);
+        let cloud_f = args
+            .get("cloud")
+            .and_then(|v| v.as_str())
+            .and_then(Cloud::parse);
+        let account_f = args
+            .get("account")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let store = oscar_core::Paths::discover()
+            .and_then(|p| ProfileStore::load(&p))
+            .unwrap_or_else(|_| {
+                ProfileStore::load_path(std::path::Path::new("/var/empty/oscar-no-profiles.toml"))
+                    .expect("empty")
+            });
+        let inv = if live {
+            build_identity_inventory(&store, &ctx.binaries)
+        } else {
+            build_identity_inventory_quick(&store)
+        };
+
+        let mut usable = Vec::new();
+        let mut needs_auth = Vec::new();
+        let mut rows = Vec::new();
+        for e in &inv.entries {
+            if let Some(c) = cloud_f {
+                if e.cloud != c.to_string() && e.cloud != "multi" {
+                    // allow binary session labels
+                    if !e.cloud.eq_ignore_ascii_case(&c.to_string()) {
+                        continue;
+                    }
+                }
+            }
+            if let Some(ref acc) = account_f {
+                let hit = e
+                    .account_ref
+                    .as_deref()
+                    .map(|a| a.contains(acc.as_str()))
+                    .unwrap_or(false)
+                    || e.detail.contains(acc.as_str())
+                    || e.id.contains(acc.as_str());
+                if !hit {
+                    continue;
+                }
+            }
+            let row = json!({
+                "id": e.id,
+                "kind": e.kind,
+                "cloud": e.cloud,
+                "label": e.label,
+                "account_ref": e.account_ref,
+                "auth_source": e.auth_source,
+                "secrets_present": e.secrets_present, // kinds only
+                "validity": e.validity.as_str(),
+                "detail": e.detail,
+                "usable_now": matches!(e.validity, Validity::Valid),
+            });
+            if matches!(e.validity, Validity::Valid) {
+                usable.push(e.id.clone());
+            } else if matches!(
+                e.validity,
+                Validity::Missing | Validity::Expired | Validity::Invalid
+            ) {
+                needs_auth.push(e.id.clone());
+            }
+            rows.push(row);
+        }
+
+        let preferred = ctx.preferred_profile_id.clone();
+        ToolResult::success(
+            format!(
+                "access review: {} shown · usable_now={} · need_auth={} · preferred={}",
+                rows.len(),
+                usable.len(),
+                needs_auth.len(),
+                preferred.as_deref().unwrap_or("(none)")
+            ),
+            json!({
+                "preferred_profile_id": preferred,
+                "usable_profile_ids": usable,
+                "needs_auth_ids": needs_auth,
+                "entries": rows,
+                "notes": inv.notes,
+                "agent_guidance": [
+                    "If the target account is missing: system.access.prepare with cloud+account",
+                    "If profile exists but needs_auth: system.access.prepare again or ask user to secure-paste short-lived keys / SSO",
+                    "To pivot mid-session: system.access.select profile_id=… then pass profile_id on tools",
+                    "Never request raw keys in chat; secure bar / oscar auth only",
+                ],
+            }),
+        )
+    }
+}
+
+#[async_trait]
+impl Tool for SystemAccessSelect {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "system.access.select".into(),
+            name: "Select preferred profile for session pivot".into(),
+            description: "Set (or clear) the session preferred oscar profile so subsequent tools that omit profile_id target that account. Use after system.access.review when pivoting multi-account/CSP troubleshooting. Does not change secrets.".into(),
+            domain: ToolDomain::Meta,
+            clouds: vec![Cloud::Multi],
+            capability: Capability::Read,
+            tags: vec![
+                "access".into(),
+                "select".into(),
+                "pivot".into(),
+                "profile".into(),
+                "preferred".into(),
+                "multi-account".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "profile_id": {
+                        "type": "string",
+                        "description": "Profile id to prefer for this session (omit or empty with clear=true to clear)"
+                    },
+                    "clear": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Clear preferred profile"
+                    }
+                }
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        if args.get("clear").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return ToolResult::success(
+                "cleared session preferred profile",
+                json!({
+                    "clear_preferred_profile": true,
+                    "previous": ctx.preferred_profile_id,
+                }),
+            );
+        }
+        let pid = args
+            .get("profile_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if pid.is_empty() {
+            return ToolResult::error("profile_id required (or clear=true)");
+        }
+        if ctx.profiles.get(pid).is_none() {
+            return ToolResult::error(format!(
+                "unknown profile `{pid}` — system.access.prepare or system.profiles.list first"
+            ));
+        }
+        let p = ctx.profiles.get(pid).unwrap();
+        ToolResult::success(
+            format!(
+                "session preferred profile → `{pid}` ({} account {})",
+                p.cloud, p.account_ref
+            ),
+            json!({
+                "set_preferred_profile": pid,
+                "profile": {
+                    "id": p.id,
+                    "cloud": p.cloud.to_string(),
+                    "account_ref": p.account_ref,
+                    "label": p.label,
+                    "default_region": p.default_region,
+                },
+                "hint": "Tools without profile_id now prefer this profile when cloud matches. Override with explicit profile_id anytime.",
+            }),
+        )
     }
 }
 

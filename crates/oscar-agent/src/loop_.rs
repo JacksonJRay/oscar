@@ -62,6 +62,8 @@ pub struct Agent {
     /// Provider/model labels for session metadata.
     pub provider_id: String,
     pub model_id: String,
+    /// Session pivot: tools that omit `profile_id` prefer this oscar profile (multi-account).
+    pub preferred_profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,9 +135,16 @@ impl Agent {
             pending_install: None,
             provider_id,
             model_id,
+            preferred_profile_id: None,
         };
         agent.refresh_system();
         agent
+    }
+
+    /// Pivot troubleshooting to a local profile (multi-account / multi-CSP).
+    pub fn set_preferred_profile(&mut self, profile_id: Option<String>) {
+        self.preferred_profile_id = profile_id;
+        self.refresh_system();
     }
 
     /// Restore conversation from a saved session (E1 persistence).
@@ -328,9 +337,19 @@ impl Agent {
         );
         let skills_cat = skills_catalog_prompt(&self.skills);
         let active_body = self.active_skills_body();
+        let mut profiles_summary = self.profiles.agent_summary();
+        if let Some(pref) = &self.preferred_profile_id {
+            profiles_summary.push_str(&format!(
+                "\n**Session preferred profile (pivot):** `{pref}` — pass `profile_id` to override; tools that omit profile_id use this when cloud matches."
+            ));
+        } else {
+            profiles_summary.push_str(
+                "\n**Multi-profile:** oscar is not locked to one account. Use `system.access.review` then `system.access.prepare` / `system.access.select` to pivot accounts/CSPs. Pass `profile_id` on tools when targeting a specific account.",
+            );
+        }
         let sys = system_prompt(
             self.session.mode,
-            &self.profiles.agent_summary(),
+            &profiles_summary,
             &context_line,
             &primer,
             &skills_cat,
@@ -804,6 +823,7 @@ impl Agent {
                         binaries: Arc::clone(&self.binaries),
                         settings: Arc::clone(&self.settings),
                         skills_settings: Arc::clone(&self.skills_settings),
+                        preferred_profile_id: self.preferred_profile_id.clone(),
                     };
                     let mut result = self.tools.execute(&tool_id, args.clone(), &ctx).await;
 
@@ -896,6 +916,22 @@ impl Agent {
                                 self.reload_profiles(Arc::new(store));
                             }
                         }
+                    }
+                    // Multi-account pivot: tools may set session preferred profile.
+                    if let Some(pid) = result
+                        .data
+                        .get("set_preferred_profile")
+                        .and_then(|v| v.as_str())
+                    {
+                        self.set_preferred_profile(Some(pid.to_string()));
+                    }
+                    if result
+                        .data
+                        .get("clear_preferred_profile")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        self.set_preferred_profile(None);
                     }
 
                     if let Some(auth) = result.auth_required.clone() {
@@ -1008,6 +1044,7 @@ impl Agent {
             binaries: Arc::clone(&self.binaries),
             settings: Arc::clone(&self.settings),
             skills_settings: Arc::clone(&self.skills_settings),
+            preferred_profile_id: self.preferred_profile_id.clone(),
         };
         let _ = tx
             .send(AgentEvent::ToolStart {

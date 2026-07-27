@@ -84,10 +84,7 @@ impl Tool for AzureDnsZonesList {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Azure,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Azure, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(
@@ -185,7 +182,7 @@ impl Tool for AzureDnsPatternSearch {
             Ok(q) => q,
             Err(e) => return ToolResult::error(e),
         };
-        let profiles = resolve_profiles(&ctx.profiles, Cloud::Azure, q.profile_id.as_deref());
+        let profiles = ctx.profiles_for(Cloud::Azure, q.profile_id.as_deref());
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(
                 Cloud::Azure,
@@ -248,10 +245,7 @@ impl Tool for AzureDnsInventorySync {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Azure,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Azure, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(
@@ -353,10 +347,7 @@ impl Tool for AzureDnsRecordCreate {
         use oscar_identity::{resolve_azure_hints, BinaryInventory};
         use oscar_tools::sync::{run_json_command, which_ok};
 
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Azure,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Azure, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(Cloud::Azure, "Azure profile required"));
@@ -550,10 +541,7 @@ impl Tool for AzureDnsRecordDelete {
         use oscar_identity::{resolve_azure_hints, BinaryInventory};
         use oscar_tools::sync::{run_json_command, which_ok};
 
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Azure,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Azure, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(Cloud::Azure, "Azure profile required"));
@@ -684,10 +672,7 @@ impl Tool for AzureNetworkPathTroubleshoot {
         if source.is_empty() || dest.is_empty() {
             return ToolResult::error("source and destination are required");
         }
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Azure,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Azure, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(
@@ -782,10 +767,7 @@ impl Tool for AzureNetworkNextHop {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Azure,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Azure, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(
@@ -845,7 +827,7 @@ async fn azure_net_pattern(args: serde_json::Value, ctx: &ToolContext, only_subn
         Ok(q) => q,
         Err(e) => return ToolResult::error(e),
     };
-    let profiles = resolve_profiles(&ctx.profiles, Cloud::Azure, q.profile_id.as_deref());
+    let profiles = ctx.profiles_for(Cloud::Azure, q.profile_id.as_deref());
     if profiles.is_empty() {
         return ToolResult::needs_auth(auth_for(
             Cloud::Azure,
@@ -927,10 +909,7 @@ impl Tool for AzureNetworkInventorySync {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Azure,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Azure, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(

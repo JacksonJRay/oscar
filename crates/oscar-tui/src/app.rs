@@ -604,14 +604,23 @@ impl App {
                 }
                 self.push_line(
                     LineKind::System,
-                    "After auth, oscar auto-retries the paused tool.",
+                    "After auth, oscar auto-retries the paused tool. Secrets go to OS keychain only — the agent never sees pasted values.",
                 );
                 if auth.kinds.is_empty() {
                     self.push_line(
                         LineKind::System,
-                        "No secret fields to paste — run the hint command (e.g. aws sso login), then send any message or wait for resume.",
+                        "No secret fields to paste — run the hint command (e.g. aws sso login), then type `retry`.",
                     );
                 } else {
+                    let fields: Vec<_> = auth.kinds.iter().map(|k| format!("{k:?}")).collect();
+                    self.push_line(
+                        LineKind::System,
+                        format!(
+                            "SECURE bar (masked): paste fields in order [{}] for profile `{}` — not in chat.",
+                            fields.join(" → "),
+                            auth.profile_hint.as_deref().unwrap_or("?")
+                        ),
+                    );
                     self.input_mode = InputMode::secure(auth);
                     self.input.clear();
                 }

@@ -76,12 +76,27 @@ pub fn first_aws_profile<'a>(
     profiles: &'a oscar_identity::ProfileStore,
     profile_id: Option<&str>,
 ) -> Result<&'a Profile, oscar_tools::ToolResult> {
+    first_aws_profile_pref(profiles, profile_id, None)
+}
+
+pub fn first_aws_profile_pref<'a>(
+    profiles: &'a oscar_identity::ProfileStore,
+    profile_id: Option<&str>,
+    preferred_profile_id: Option<&str>,
+) -> Result<&'a Profile, oscar_tools::ToolResult> {
     if let Some(id) = profile_id {
         return profiles.get(id).ok_or_else(|| {
             oscar_tools::ToolResult::needs_auth(
                 oscar_tools::auth_for(Cloud::Aws, format!("Unknown profile `{id}`")).profile(id),
             )
         });
+    }
+    if let Some(id) = preferred_profile_id {
+        if let Some(p) = profiles.get(id) {
+            if p.cloud == Cloud::Aws {
+                return Ok(p);
+            }
+        }
     }
     profiles
         .list()
@@ -90,7 +105,7 @@ pub fn first_aws_profile<'a>(
         .ok_or_else(|| {
             oscar_tools::ToolResult::needs_auth(oscar_tools::auth_for(
                 Cloud::Aws,
-                "No AWS profile configured — `oscar profiles add --cloud aws --label default --account <id>` or authenticate ambient aws CLI",
+                "No AWS profile configured — call system.access.prepare with cloud=aws (+ account), or `oscar profiles add`",
             ))
         })
 }
@@ -100,7 +115,15 @@ pub fn resolve_aws_profile(
     profiles: &oscar_identity::ProfileStore,
     profile_id: Option<&str>,
 ) -> Result<Profile, oscar_tools::ToolResult> {
-    match first_aws_profile(profiles, profile_id) {
+    resolve_aws_profile_pref(profiles, profile_id, None)
+}
+
+pub fn resolve_aws_profile_pref(
+    profiles: &oscar_identity::ProfileStore,
+    profile_id: Option<&str>,
+    preferred_profile_id: Option<&str>,
+) -> Result<Profile, oscar_tools::ToolResult> {
+    match first_aws_profile_pref(profiles, profile_id, preferred_profile_id) {
         Ok(p) => Ok(p.clone()),
         Err(e) if profile_id.is_some() => Err(e),
         Err(_) => {
@@ -108,6 +131,29 @@ pub fn resolve_aws_profile(
             Ok(Profile::new(Cloud::Aws, "ambient", "ambient"))
         }
     }
+}
+
+/// Prefer session pivot profile when tools omit `profile_id`.
+pub fn resolve_aws_profile_ctx(
+    ctx: &oscar_tools::ToolContext,
+    profile_id: Option<&str>,
+) -> Result<Profile, oscar_tools::ToolResult> {
+    resolve_aws_profile_pref(
+        &ctx.profiles,
+        profile_id,
+        ctx.preferred_profile_id.as_deref(),
+    )
+}
+
+pub fn first_aws_profile_ctx<'a>(
+    ctx: &'a oscar_tools::ToolContext,
+    profile_id: Option<&str>,
+) -> Result<&'a Profile, oscar_tools::ToolResult> {
+    first_aws_profile_pref(
+        &ctx.profiles,
+        profile_id,
+        ctx.preferred_profile_id.as_deref(),
+    )
 }
 
 pub fn arg_str<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {

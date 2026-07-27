@@ -44,10 +44,7 @@ impl Tool for GcpDnsResolverInventorySync {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Gcp,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Gcp, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(
@@ -116,7 +113,7 @@ impl Tool for GcpDnsPolicyPatternSearch {
             Ok(q) => q,
             Err(e) => return ToolResult::error(e),
         };
-        let profiles = resolve_profiles(&ctx.profiles, Cloud::Gcp, q.profile_id.as_deref());
+        let profiles = ctx.profiles_for(Cloud::Gcp, q.profile_id.as_deref());
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(Cloud::Gcp, "GCP profile required"));
         }

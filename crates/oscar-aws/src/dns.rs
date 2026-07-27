@@ -1,4 +1,4 @@
-use crate::aws_runtime::{arg_str, aws_json, require_str, resolve_aws_profile};
+use crate::aws_runtime::{arg_str, aws_json, require_str, resolve_aws_profile_ctx};
 use crate::sync_dns::AwsDnsSource;
 use async_trait::async_trait;
 use oscar_core::{Capability, Cloud, PatternQuery, ToolDomain};
@@ -18,7 +18,7 @@ pub struct AwsDnsRecordCreate;
 pub struct AwsDnsRecordDelete;
 
 fn needs_aws(ctx: &ToolContext, reason: &str) -> Option<ToolResult> {
-    if resolve_profiles(&ctx.profiles, Cloud::Aws, None).is_empty() {
+    if ctx.profiles_for(Cloud::Aws, None).is_empty() {
         Some(ToolResult::needs_auth(auth_for(Cloud::Aws, reason)))
     } else {
         None
@@ -58,7 +58,7 @@ impl Tool for AwsDnsZonesList {
             return r;
         }
         let profile_id = args.get("profile_id").and_then(|v| v.as_str());
-        let profiles = resolve_profiles(&ctx.profiles, Cloud::Aws, profile_id);
+        let profiles = ctx.profiles_for(Cloud::Aws, profile_id);
         let mut zones = Vec::new();
         let mut partial = false;
         for p in profiles {
@@ -188,7 +188,7 @@ impl Tool for AwsDnsPatternSearch {
             Ok(q) => q,
             Err(e) => return ToolResult::error(e),
         };
-        let profiles = resolve_profiles(&ctx.profiles, Cloud::Aws, q.profile_id.as_deref());
+        let profiles = ctx.profiles_for(Cloud::Aws, q.profile_id.as_deref());
         if profiles.is_empty() {
             return ToolResult::needs_auth(
                 auth_for(
@@ -294,10 +294,7 @@ impl Tool for AwsDnsInventorySync {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Aws,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Aws, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(
@@ -475,7 +472,7 @@ impl Tool for AwsDnsRecordCreate {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, arg_str(&args, "profile_id")) {
+        let profile = match resolve_aws_profile_ctx(ctx, arg_str(&args, "profile_id")) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -575,7 +572,7 @@ impl Tool for AwsDnsRecordDelete {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, arg_str(&args, "profile_id")) {
+        let profile = match resolve_aws_profile_ctx(ctx, arg_str(&args, "profile_id")) {
             Ok(p) => p,
             Err(e) => return e,
         };

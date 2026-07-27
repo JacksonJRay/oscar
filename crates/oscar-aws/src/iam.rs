@@ -3,7 +3,7 @@
 //! Live via `aws iam` + `aws sts`. Mutations require session `readwrite` mode.
 //! Secrets (access keys) are never returned to the model transcript.
 
-use crate::aws_runtime::{arg_str, aws_cli, aws_json, require_str, resolve_aws_profile};
+use crate::aws_runtime::{arg_str, aws_cli, aws_json, require_str, resolve_aws_profile_ctx};
 use async_trait::async_trait;
 use oscar_core::{
     AccessCheckResult, AccessDecision, AccessEntity, AccessObjectKind, Capability, Cloud,
@@ -247,7 +247,7 @@ impl Tool for AwsIamCallerIdentity {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -287,7 +287,7 @@ impl Tool for AwsIamUsersList {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -343,7 +343,7 @@ impl Tool for AwsIamUserGet {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -440,7 +440,7 @@ impl Tool for AwsIamRolesList {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -496,7 +496,7 @@ impl Tool for AwsIamRoleGet {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -574,7 +574,7 @@ impl Tool for AwsIamGroupsList {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -634,7 +634,7 @@ impl Tool for AwsIamGroupGet {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -692,7 +692,7 @@ impl Tool for AwsIamPoliciesList {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -751,7 +751,7 @@ impl Tool for AwsIamPolicyGet {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -820,7 +820,7 @@ impl Tool for AwsIamPatternSearch {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -964,7 +964,7 @@ impl Tool for AwsIamSimulate {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1100,7 +1100,7 @@ impl Tool for AwsIamAccessTest {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1173,7 +1173,7 @@ impl Tool for AwsIamUserCreate {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1220,7 +1220,7 @@ impl Tool for AwsIamUserDelete {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1267,7 +1267,7 @@ impl Tool for AwsIamRoleCreate {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1328,7 +1328,7 @@ impl Tool for AwsIamRoleDelete {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1370,7 +1370,7 @@ impl Tool for AwsIamGroupCreate {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1424,7 +1424,7 @@ impl Tool for AwsIamGroupDelete {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1468,7 +1468,7 @@ impl Tool for AwsIamPolicyCreate {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1529,7 +1529,7 @@ impl Tool for AwsIamPolicyDelete {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1572,7 +1572,7 @@ impl Tool for AwsIamPolicyAttach {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1639,7 +1639,7 @@ impl Tool for AwsIamPolicyDetach {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1705,7 +1705,7 @@ impl Tool for AwsIamGroupAddUser {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1763,7 +1763,7 @@ impl Tool for AwsIamGroupRemoveUser {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1823,7 +1823,7 @@ impl Tool for AwsIamInlinePolicyPut {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1903,7 +1903,7 @@ impl Tool for AwsIamInlinePolicyDelete {
         })
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
-        let profile = match resolve_aws_profile(&ctx.profiles, profile_id_arg(&args)) {
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id_arg(&args)) {
             Ok(p) => p,
             Err(e) => return e,
         };

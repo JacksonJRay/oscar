@@ -14,8 +14,9 @@ Release artifacts (Linux) are attached to GitHub Releases:
 
 ### Added
 
-- **`system.access.prepare`** — agent tool to create/update local oscar profile metadata when the user wants access to a cloud/account; returns CSP-specific SSO/session/keychain next steps and `auth_required` for TUI secure bar (no secrets in chat). Also `system.profiles.list`.
-- Profile store `ensure_profile` helper; agent reloads profiles mid-session when tools set `reload_profiles`
+- **Multi-profile access pivot:** `system.access.prepare` (create per-account profile + short-lived secure paste/SSO), `system.access.review` (list usable creds without values), `system.access.select` (session preferred profile). Also `system.profiles.list`.
+- Session `preferred_profile_id` so tools that omit `profile_id` target the active account; AWS ambient CLI only reused when account matches profile (no silent cross-account).
+- Secure bar: multi-field short-term paste (access/secret/session); resume only when all fields stored; agent never sees secret values.
 
 ### Planned
 

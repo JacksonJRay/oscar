@@ -34,7 +34,7 @@ COMMON TOOL FAMILIES
 - Path troubleshooting: aws.network.path.analyze, aws.network.access.analyze, gcp.network.connectivity.test, azure.network.path.troubleshoot, azure.network.next_hop
 - K8s CNI: k8s.cni.detect, k8s.hubble.*, k8s.calico.*, k8s.cilium.*, k8s.networkpolicy.deny.narrative, k8s.coredns.discover
 - IAM: aws.iam.*, gcp.iam.*, azure.iam.*, access.troubleshoot
-- **Access onboarding:** system.access.prepare (create local profile + sign-in steps), system.profiles.list, system.identities.list
+- **Access / multi-profile:** system.access.review (what creds exist), system.access.prepare (create profile + secure paste/SSO), system.access.select (session pivot), system.profiles.list, system.identities.list
 - Skills: system.skills.list, system.skills.get (user steering playbooks)
 - Binaries: system.binaries.list, system.binaries.install_plan (when feasibility=unavailable)
 - MCP: tools with id mcp.<server>.<tool> (configured in TOML; never dumped into system prompt)
@@ -86,7 +86,7 @@ pub fn agent_tools_primer() -> &'static str {
 4. Prefer feasibility=available. Do not invent shell use of missing CLIs.
 5. Missing binaries: follow install_binaries policy via `system.binaries.install_plan` (never sudo yourself).
 6. auth_required: show hint_commands; wait for user auth/retry — never collect secrets in chat.
-6b. User wants a new cloud/account: `system.access.prepare` (local profile + SSO/session steps) before other CSP tools.
+6b. Multi-account: `system.access.review` → `system.access.prepare` (profile + short-lived secure paste) → tools with `profile_id`. Pivot: `system.access.select`.
 7. Pattern + inventory for discovery; path analyzers for reachability; IAM tools for access.
 8. **Skills:** `system.skills.list` / `system.skills.get` load user/project playbooks that steer beyond the harness.
 9. **IAM:** access.troubleshoot → simulate/test; manage create/delete/attach requires **readwrite**; least privilege always.

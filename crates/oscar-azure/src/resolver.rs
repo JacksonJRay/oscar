@@ -45,10 +45,7 @@ impl Tool for AzureDnsResolverInventorySync {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Azure,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Azure, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(
@@ -100,7 +97,7 @@ async fn azure_resolver_pattern(
         Ok(q) => q,
         Err(e) => return ToolResult::error(e),
     };
-    let profiles = resolve_profiles(&ctx.profiles, Cloud::Azure, q.profile_id.as_deref());
+    let profiles = ctx.profiles_for(Cloud::Azure, q.profile_id.as_deref());
     if profiles.is_empty() {
         return ToolResult::needs_auth(auth_for(Cloud::Azure, "Azure profile required"));
     }

@@ -35,6 +35,20 @@ pub struct ToolContext {
     pub settings: Arc<ToolsSettings>,
     /// Skills discovery settings.
     pub skills_settings: Arc<SkillsSettings>,
+    /// Session pivot: when tools omit `profile_id`, prefer this profile if it matches cloud.
+    pub preferred_profile_id: Option<String>,
+}
+
+impl ToolContext {
+    /// Profiles for a cloud: explicit `profile_id` → session preferred → all matching cloud.
+    pub fn profiles_for(&self, cloud: Cloud, profile_id: Option<&str>) -> Vec<&oscar_identity::Profile> {
+        crate::helpers::resolve_profiles_pref(
+            &self.profiles,
+            cloud,
+            profile_id,
+            self.preferred_profile_id.as_deref(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

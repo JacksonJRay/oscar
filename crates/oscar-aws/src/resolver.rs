@@ -17,7 +17,7 @@ pub struct AwsDnsQueryLogPatternSearch;
 pub struct AwsDnsProfilePatternSearch;
 
 fn needs_aws(ctx: &ToolContext, reason: &str) -> Option<ToolResult> {
-    if resolve_profiles(&ctx.profiles, Cloud::Aws, None).is_empty() {
+    if ctx.profiles_for(Cloud::Aws, None).is_empty() {
         Some(ToolResult::needs_auth(auth_for(Cloud::Aws, reason)))
     } else {
         None
@@ -60,10 +60,7 @@ impl Tool for AwsDnsResolverInventorySync {
         if let Some(r) = needs_aws(ctx, "AWS profile required to sync Route 53 Resolver") {
             return r;
         }
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Aws,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Aws, args.get("profile_id").and_then(|v| v.as_str()),
         );
         let region = args.get("region").and_then(|v| v.as_str());
         let source = AwsDnsResolverSource;
@@ -119,7 +116,7 @@ async fn resolver_pattern(
         Ok(q) => q,
         Err(e) => return ToolResult::error(e),
     };
-    let profiles = resolve_profiles(&ctx.profiles, Cloud::Aws, q.profile_id.as_deref());
+    let profiles = ctx.profiles_for(Cloud::Aws, q.profile_id.as_deref());
     if profiles.is_empty() {
         return ToolResult::needs_auth(auth_for(
             Cloud::Aws,

@@ -77,10 +77,7 @@ impl Tool for GcpDnsZonesList {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Gcp,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Gcp, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(
@@ -179,7 +176,7 @@ impl Tool for GcpDnsPatternSearch {
             Ok(q) => q,
             Err(e) => return ToolResult::error(e),
         };
-        let profiles = resolve_profiles(&ctx.profiles, Cloud::Gcp, q.profile_id.as_deref());
+        let profiles = ctx.profiles_for(Cloud::Gcp, q.profile_id.as_deref());
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(
                 Cloud::Gcp,
@@ -248,10 +245,7 @@ impl Tool for GcpDnsInventorySync {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Gcp,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Gcp, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(
@@ -311,7 +305,7 @@ fn gcp_project_profile<'a>(
     ctx: &'a ToolContext,
     profile_id: Option<&str>,
 ) -> Result<&'a oscar_identity::Profile, ToolResult> {
-    let profiles = resolve_profiles(&ctx.profiles, Cloud::Gcp, profile_id);
+    let profiles = ctx.profiles_for(Cloud::Gcp, profile_id);
     profiles.first().copied().ok_or_else(|| {
         ToolResult::needs_auth(auth_for(
             Cloud::Gcp,
@@ -569,10 +563,7 @@ impl Tool for GcpConnectivityTest {
         if source.is_empty() || dest.is_empty() {
             return ToolResult::error("source and destination are required");
         }
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Gcp,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Gcp, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(
@@ -672,7 +663,7 @@ async fn gcp_net_pattern(args: serde_json::Value, ctx: &ToolContext, only_subnet
         Ok(q) => q,
         Err(e) => return ToolResult::error(e),
     };
-    let profiles = resolve_profiles(&ctx.profiles, Cloud::Gcp, q.profile_id.as_deref());
+    let profiles = ctx.profiles_for(Cloud::Gcp, q.profile_id.as_deref());
     if profiles.is_empty() {
         return ToolResult::needs_auth(auth_for(
             Cloud::Gcp,
@@ -754,10 +745,7 @@ impl Tool for GcpNetworkInventorySync {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let profiles = resolve_profiles(
-            &ctx.profiles,
-            Cloud::Gcp,
-            args.get("profile_id").and_then(|v| v.as_str()),
+        let profiles = ctx.profiles_for(Cloud::Gcp, args.get("profile_id").and_then(|v| v.as_str()),
         );
         if profiles.is_empty() {
             return ToolResult::needs_auth(auth_for(

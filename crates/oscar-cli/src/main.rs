@@ -961,6 +961,7 @@ async fn main() -> Result<()> {
                         binaries: Arc::new(inv),
                         settings: Arc::new(cfg.tools.clone()),
                         skills_settings: Arc::new(cfg.skills.clone()),
+                        preferred_profile_id: None,
                     };
                     let result = registry.execute(&tool_id, arguments, &ctx).await;
                     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1582,6 +1583,7 @@ async fn run_access(action: AccessCmd, cfg: &OscarConfig, paths: &Paths) -> Resu
         binaries,
         settings,
         skills_settings,
+        preferred_profile_id: None,
     };
 
     let (tool_id, args) = match action {
@@ -3289,7 +3291,7 @@ async fn run_chat_with_session(
                         .await;
                 }
                 Some((auth, kind, secret)) = secret_rx.recv() => {
-                    // Store secret; create profile shell if needed.
+                    // Store secret into keychain only — never log value or send it to the agent/model.
                     let mut store = match ProfileStore::load(&paths) {
                         Ok(s) => s,
                         Err(e) => {
@@ -3307,29 +3309,47 @@ async fn run_chat_with_session(
                         store.upsert(p);
                         let _ = store.save();
                     }
+                    let mut all_kinds_ready = false;
                     if let Some(p) = store.get(&profile_id) {
-                        // Secret only touches keychain — never log or forward raw secret to agent events.
-                        let _secret_len = secret.len();
+                        let secret_len = secret.len();
                         if let Err(e) = KeychainStore::set(&p.secret_keyring_id, kind, &secret) {
                             let _ = event_tx_host.send(AgentEvent::Error { message: e.to_string() }).await;
                         } else {
-                            // Drop secret from this scope after store; message has no secret material.
-                            let _ = event_tx_host.send(AgentEvent::ContentDelta {
-                                text: format!(
-                                    "\n[credentials stored for profile `{profile_id}` kind={kind:?} bytes={_secret_len} — value not shown to agent; auto-retrying paused tool]\n"
-                                ),
-                            }).await;
+                            // Field-by-field secure paste (e.g. access_key_id → secret → session_token).
+                            all_kinds_ready = auth.kinds.iter().all(|k| {
+                                KeychainStore::has(&p.secret_keyring_id, *k)
+                            });
+                            let msg = if all_kinds_ready {
+                                format!(
+                                    "\n[secure bar] stored {kind:?} for profile `{profile_id}` ({secret_len} bytes) — value NOT visible to agent. All requested fields present; auto-retrying paused tool.\n"
+                                )
+                            } else {
+                                format!(
+                                    "\n[secure bar] stored {kind:?} for profile `{profile_id}` ({secret_len} bytes) — value NOT visible to agent. Enter next field in the secure bar (still not shown to the agent).\n"
+                                )
+                            };
+                            let _ = event_tx_host
+                                .send(AgentEvent::ContentDelta { text: msg })
+                                .await;
                         }
                         drop(secret);
                     }
-                    // Preserve pending retry + install across profile reload.
+                    // Preserve pending retry + install + preferred profile across rebuild.
                     let pending = agent.as_ref().and_then(|a| a.pending_retry.clone());
                     let pending_install = agent.as_ref().and_then(|a| a.pending_install.clone());
+                    let preferred = agent
+                        .as_ref()
+                        .and_then(|a| a.preferred_profile_id.clone())
+                        .or_else(|| Some(profile_id.clone()));
                     match build_agent(&cfg, &paths).await {
                         Ok(mut a) => {
                             a.pending_retry = pending;
                             a.pending_install = pending_install;
-                            if a.pending_retry.is_some() {
+                            a.preferred_profile_id = preferred;
+                            a.refresh_system();
+                            // Only resume when all auth kinds for this request are in keychain
+                            // (short-lived keys are multi-field: access + secret + session token).
+                            if a.pending_retry.is_some() && all_kinds_ready {
                                 cancel = CancellationToken::new();
                                 a.resume_after_auth(event_tx_host.clone(), cancel.clone()).await;
                             }

@@ -46,7 +46,7 @@ fn profile_or_auth(
     ctx: &ToolContext,
     profile_id: Option<&str>,
 ) -> Result<Profile, ToolResult> {
-    let profiles = resolve_profiles(&ctx.profiles, Cloud::Gcp, profile_id);
+    let profiles = ctx.profiles_for(Cloud::Gcp, profile_id);
     if let Some(p) = profiles.first() {
         return Ok((*p).clone());
     }

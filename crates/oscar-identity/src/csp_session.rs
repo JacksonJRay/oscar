@@ -38,9 +38,9 @@ pub fn delete_provider_api_key(provider_id: &str) -> OscarResult<()> {
 /// Resolve AWS process credentials for CLI invocations.
 ///
 /// Order:
-/// 1. Keychain access key + secret (+ optional session token for short-lived)
-/// 2. Binary session: `aws sts get-caller-identity` succeeds with ambient config
-/// 3. Else AuthRequest
+/// 1. Keychain access key + secret (+ optional session token for short-lived) for **this** profile
+/// 2. Ambient binary session only if it targets the same account (or profile has no fixed account)
+/// 3. Else AuthRequest — never silently use ambient account A for profile bound to account B
 pub fn resolve_aws_process_creds(
     profile: &Profile,
     binaries: &BinaryInventory,
@@ -49,7 +49,7 @@ pub fn resolve_aws_process_creds(
         return Err(auth_aws_missing_binary(profile));
     }
 
-    // Keychain long-lived or short-lived
+    // Keychain long-lived or short-lived (per-profile isolation)
     if let (Ok(Some(ak)), Ok(Some(sk))) = (
         KeychainStore::get(&profile.secret_keyring_id, SecretKind::AccessKeyId),
         KeychainStore::get(&profile.secret_keyring_id, SecretKind::SecretAccessKey),
@@ -64,8 +64,9 @@ pub fn resolve_aws_process_creds(
             env.insert("AWS_SESSION_TOKEN".into(), tok);
             source = AuthSource::ShortLived;
         }
-        // Avoid picking up conflicting profile
+        // Avoid picking up conflicting ambient AWS_PROFILE / metadata
         env.insert("AWS_EC2_METADATA_DISABLED".into(), "true".into());
+        env.insert("AWS_PROFILE".into(), "".into());
         if let Some(r) = &profile.default_region {
             env.insert("AWS_DEFAULT_REGION".into(), r.clone());
             env.insert("AWS_REGION".into(), r.clone());
@@ -77,25 +78,70 @@ pub fn resolve_aws_process_creds(
         });
     }
 
-    // Ambient binary session (SSO / instance role / default chain) — allowed when detected.
-    if aws_identity_ok(None) {
-        let mut env = HashMap::new();
-        if profile.label != "default" && !profile.label.is_empty() && !profile.label.contains(' ') {
-            // Only set profile if named profile might exist; validation already ok ambient
-            // Prefer not forcing wrong profile — use empty env for default chain.
+    // Ambient binary session only when safe for this multi-profile account binding.
+    if let Some(ambient_account) = aws_caller_account(None) {
+        if profile_allows_ambient_account(profile, &ambient_account) {
+            let mut env = HashMap::new();
+            if let Some(r) = &profile.default_region {
+                env.insert("AWS_DEFAULT_REGION".into(), r.clone());
+                env.insert("AWS_REGION".into(), r.clone());
+            }
+            return Ok(ProcessCreds {
+                env,
+                source: AuthSource::BinarySession,
+                expires_at_unix: None,
+            });
         }
-        if let Some(r) = &profile.default_region {
-            env.insert("AWS_DEFAULT_REGION".into(), r.clone());
-            env.insert("AWS_REGION".into(), r.clone());
-        }
-        return Ok(ProcessCreds {
-            env,
-            source: AuthSource::BinarySession,
-            expires_at_unix: None,
-        });
+        // Ambient is a *different* account — require profile-scoped short-lived keys / SSO for this id.
+        return Err(auth_aws_needed(profile, false).with_guidance(format!(
+            "Ambient `aws` CLI is account `{ambient_account}`, but profile `{}` targets `{}`. \
+             Paste short-lived keys for this profile in the secure bar, or `oscar auth aws-session --profile {}`, \
+             or assume-role into this profile. Multi-account isolation: each oscar profile uses its own keychain namespace.",
+            profile.id,
+            profile.account_ref,
+            profile.id
+        )));
     }
 
     Err(auth_aws_needed(profile, false))
+}
+
+/// True when profile is not pinned to a specific account id (ambient/default shell ok).
+pub fn profile_has_fixed_account(profile: &Profile) -> bool {
+    let a = profile.account_ref.trim().to_ascii_lowercase();
+    !a.is_empty()
+        && a != "pending"
+        && a != "unknown"
+        && a != "ambient"
+        && a != "default"
+        && a != "n/a"
+}
+
+fn profile_allows_ambient_account(profile: &Profile, ambient_account: &str) -> bool {
+    if !profile_has_fixed_account(profile) {
+        return true;
+    }
+    profile.account_ref.trim() == ambient_account.trim()
+}
+
+/// Account id from ambient or env-scoped `aws sts get-caller-identity` (no secrets).
+fn aws_caller_account(extra_env: Option<&HashMap<String, String>>) -> Option<String> {
+    let mut cmd = Command::new("aws");
+    cmd.args(["sts", "get-caller-identity", "--output", "json"]);
+    if let Some(env) = extra_env {
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v.get("Account")
+        .and_then(|a| a.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn load_expiry(profile: &Profile) -> Option<u64> {
