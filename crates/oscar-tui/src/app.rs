@@ -1418,7 +1418,7 @@ impl App {
     }
 
     fn on_provider_key(&mut self, key: crossterm::event::KeyEvent) {
-        use crate::provider_pane::{ProviderFocus, ProviderPaneAction};
+        use crate::provider_pane::ProviderFocus;
 
         // Editing model / URL captures keys first
         let editing = matches!(&self.view, View::Provider(p) if p.edit.is_some());
