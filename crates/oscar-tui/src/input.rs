@@ -11,7 +11,8 @@ pub const IDLE_HINT_INTERVAL: Duration = Duration::from_millis(3800);
 pub const IDLE_INPUT_HINTS: &[&str] = &[
     "Ask about multi-cloud DNS, network paths, or k8s…",
     "Type /help · /provider for LLM setup · /settings (Ctrl+,)",
-    "Input bar: Ctrl+A start · Ctrl+E end · Ctrl+U clear",
+    "Tab: focus chat to select/copy · y or Ctrl+Y copy · Ctrl+V paste",
+    "Input bar: Ctrl+A start · Ctrl+E end · Ctrl+U clear · Ctrl+V paste",
     "Discover tools via Code Mode: agent uses tools_search then tools_execute",
     "Sync inventory: oscar inventory sync --cloud aws --kind dns",
     "Private DNS map: ask about forwarding or /mcp for external tools",

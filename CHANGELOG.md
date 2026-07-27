@@ -15,6 +15,7 @@ Release artifacts (Linux) are attached to GitHub Releases:
 ### Added
 
 - **Settings → Raw config:** scrollable effective `config.toml` TOML viewer (path + disk/in-memory status; API keys never appear — keychain only)
+- **Controllable chat pane + clipboard (Grok Build–style):** Tab focuses scrollback vs prompt; ↑↓ select lines; Shift+↑↓ extend highlight; `y` / Enter / Ctrl+Y copy; Ctrl+V paste; mouse click/drag select + wheel scroll; `/copy` [n|path]; OSC 52 + native clipboard + `~/.config/oscar/last-copy.txt` backup
 
 ### Planned
 

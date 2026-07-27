@@ -1,9 +1,13 @@
+use crate::clipboard;
 use crate::identities::IdentitiesPane;
 use crate::input::{IdleHintRotator, InputMode};
 use crate::provider_pane::{ProviderPane, ProviderPaneAction};
 use crate::settings::{SettingsPane, ToolCatalogEntry};
 use crate::ui;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -83,6 +87,46 @@ pub enum View {
     Provider(ProviderPane),
 }
 
+/// Which controllable pane owns keyboard navigation (Grok Build–style).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneFocus {
+    /// Composer / input bar (default).
+    #[default]
+    Prompt,
+    /// Chat scrollback — select lines, highlight, copy.
+    Scrollback,
+}
+
+/// Inclusive line selection in the chat scrollback (`lines` indices).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineSelection {
+    pub anchor: usize,
+    pub cursor: usize,
+}
+
+impl LineSelection {
+    pub fn single(idx: usize) -> Self {
+        Self {
+            anchor: idx,
+            cursor: idx,
+        }
+    }
+
+    pub fn range(&self) -> (usize, usize) {
+        (self.anchor.min(self.cursor), self.anchor.max(self.cursor))
+    }
+
+    pub fn contains(&self, idx: usize) -> bool {
+        let (a, b) = self.range();
+        idx >= a && idx <= b
+    }
+
+    pub fn line_count(&self) -> usize {
+        let (a, b) = self.range();
+        b.saturating_sub(a) + 1
+    }
+}
+
 pub struct App {
     pub config: AppConfig,
     pub lines: Vec<ChatLine>,
@@ -124,6 +168,16 @@ pub struct App {
     pub activity: AgentActivity,
     /// Spinner frame index for live activity.
     pub activity_tick: usize,
+    /// Controllable pane focus (prompt vs scrollback).
+    pub pane_focus: PaneFocus,
+    /// Highlighted line range when scrollback is focused (or after click).
+    pub selection: Option<LineSelection>,
+    /// Brief status flash after copy/paste (also pushed as a system line when useful).
+    pub copy_flash: Option<String>,
+    /// Cached layout: last drawn chat pane rect (for mouse hit-testing).
+    pub chat_area: Option<(u16, u16, u16, u16)>, // x,y,w,h
+    /// Cached layout: last drawn input pane rect.
+    pub input_area: Option<(u16, u16, u16, u16)>,
     /// True while a thinking stream is open (header + body).
     thinking_open: bool,
     /// Chars received in the current thinking block.
@@ -172,6 +226,11 @@ impl App {
             stick_to_bottom: true,
             activity: AgentActivity::Idle,
             activity_tick: 0,
+            pane_focus: PaneFocus::Prompt,
+            selection: None,
+            copy_flash: None,
+            chat_area: None,
+            input_area: None,
             thinking_open: false,
             thinking_chars: 0,
         };
@@ -431,6 +490,325 @@ impl App {
         let next = (self.chat_scroll as i32 + delta).clamp(0, max);
         self.chat_scroll = next as usize;
         self.stick_to_bottom = self.chat_scroll == 0;
+    }
+
+    /// Focus the prompt (composer). Clears scrollback-only key modes.
+    pub fn focus_prompt(&mut self) {
+        self.pane_focus = PaneFocus::Prompt;
+        // Keep selection highlight visible briefly? Grok clears when typing — keep until leave.
+    }
+
+    /// Focus the chat scrollback and ensure a selection exists.
+    pub fn focus_scrollback(&mut self) {
+        self.pane_focus = PaneFocus::Scrollback;
+        if self.selection.is_none() && !self.lines.is_empty() {
+            // Prefer newest line (bottom of transcript).
+            let idx = self.lines.len() - 1;
+            self.selection = Some(LineSelection::single(idx));
+            self.ensure_selection_visible();
+        }
+        self.stick_to_bottom = false;
+    }
+
+    pub fn toggle_pane_focus(&mut self) {
+        match self.pane_focus {
+            PaneFocus::Prompt => self.focus_scrollback(),
+            PaneFocus::Scrollback => self.focus_prompt(),
+        }
+    }
+
+    /// Move selection cursor by `delta` lines. When `extend`, keep anchor (Shift+arrows).
+    pub fn move_selection(&mut self, delta: i32, extend: bool) {
+        if self.lines.is_empty() {
+            return;
+        }
+        let last = self.lines.len() - 1;
+        let cur = self
+            .selection
+            .map(|s| s.cursor)
+            .unwrap_or(last);
+        let next = (cur as i32 + delta).clamp(0, last as i32) as usize;
+        if extend {
+            if let Some(sel) = self.selection.as_mut() {
+                sel.cursor = next;
+            } else {
+                self.selection = Some(LineSelection::single(next));
+            }
+        } else {
+            self.selection = Some(LineSelection::single(next));
+        }
+        self.ensure_selection_visible();
+        self.pane_focus = PaneFocus::Scrollback;
+    }
+
+    /// Keep the selection cursor inside the visible viewport by adjusting `chat_scroll`.
+    pub fn ensure_selection_visible(&mut self) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let total = self.lines.len();
+        if total == 0 {
+            return;
+        }
+        // Viewport height unknown here — use a conservative 12-line page when scrolling.
+        // UI also re-clamps; this keeps cursor roughly on screen for keyboard nav.
+        let page = 12usize;
+        let cursor = sel.cursor.min(total - 1);
+        // Distance from bottom: 0 = last line
+        let from_bottom = total - 1 - cursor;
+        if from_bottom < self.chat_scroll {
+            // Cursor below viewport (newer than scroll window) → scroll down
+            self.chat_scroll = from_bottom;
+        } else if from_bottom >= self.chat_scroll + page {
+            // Cursor above viewport → scroll up so cursor near top
+            self.chat_scroll = from_bottom.saturating_sub(page.saturating_sub(1));
+        }
+        self.chat_scroll = self.chat_scroll.min(self.max_chat_scroll());
+        self.stick_to_bottom = self.chat_scroll == 0 && self.pane_focus == PaneFocus::Prompt;
+    }
+
+    /// Text for the current selection (or last assistant message if none).
+    pub fn selection_text(&self) -> Option<String> {
+        if let Some(sel) = self.selection {
+            let (a, b) = sel.range();
+            if a < self.lines.len() {
+                let end = b.min(self.lines.len() - 1);
+                let text = self.lines[a..=end]
+                    .iter()
+                    .map(|l| l.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Some(text);
+            }
+        }
+        // Fallback: most recent assistant block (contiguous assistant lines from end)
+        let mut collected = Vec::new();
+        for l in self.lines.iter().rev() {
+            if l.kind == LineKind::Assistant {
+                collected.push(l.text.as_str());
+            } else if !collected.is_empty() {
+                break;
+            }
+        }
+        if collected.is_empty() {
+            None
+        } else {
+            collected.reverse();
+            Some(collected.join("\n"))
+        }
+    }
+
+    /// Copy selection (or last assistant) to clipboard + backup.
+    pub fn copy_selection(&mut self) {
+        let Some(text) = self.selection_text() else {
+            self.copy_flash = Some("Nothing to copy".into());
+            self.push_line(LineKind::System, "Nothing to copy (no selection / assistant reply).");
+            return;
+        };
+        let outcome = clipboard::copy_text(&text);
+        self.copy_flash = Some(outcome.message.clone());
+        let n = self.selection.map(|s| s.line_count()).unwrap_or(1);
+        self.push_line(
+            LineKind::System,
+            format!("{} · {n} line(s)", outcome.message),
+        );
+    }
+
+    /// `/copy` [n] — copy Nth-latest assistant reply (1 = most recent).
+    pub fn copy_nth_assistant(&mut self, n: usize) {
+        let n = n.max(1);
+        let mut blocks: Vec<String> = Vec::new();
+        let mut cur: Vec<&str> = Vec::new();
+        for l in &self.lines {
+            if l.kind == LineKind::Assistant {
+                cur.push(l.text.as_str());
+            } else if !cur.is_empty() {
+                blocks.push(cur.join("\n"));
+                cur.clear();
+            }
+        }
+        if !cur.is_empty() {
+            blocks.push(cur.join("\n"));
+        }
+        if blocks.is_empty() {
+            self.push_line(LineKind::System, "No assistant replies to copy.");
+            return;
+        }
+        let idx_from_end = n - 1;
+        if idx_from_end >= blocks.len() {
+            self.push_line(
+                LineKind::System,
+                format!("Only {} assistant reply block(s).", blocks.len()),
+            );
+            return;
+        }
+        let text = &blocks[blocks.len() - 1 - idx_from_end];
+        let outcome = clipboard::copy_text(text);
+        self.copy_flash = Some(outcome.message.clone());
+        self.push_line(
+            LineKind::System,
+            format!("{} · assistant reply #{n}", outcome.message),
+        );
+    }
+
+    /// Paste clipboard into the input bar at the cursor.
+    pub fn paste_into_input(&mut self) {
+        if matches!(self.input_mode, InputMode::Secure { .. }) {
+            // Secure: paste as secret buffer (still masked)
+            if let Some(text) = clipboard::paste_text() {
+                let cleaned = text.trim_end_matches(['\r', '\n']);
+                if let InputMode::Secure { buffer, .. } = &mut self.input_mode {
+                    // Insert at cursor in buffer
+                    let mut chars: Vec<char> = buffer.chars().collect();
+                    let pos = self.input_cursor.min(chars.len());
+                    for (i, c) in cleaned.chars().enumerate() {
+                        chars.insert(pos + i, c);
+                    }
+                    *buffer = chars.into_iter().collect();
+                    self.input_cursor = pos + cleaned.chars().count();
+                }
+                self.copy_flash = Some("Pasted into secure bar (masked)".into());
+            } else {
+                self.copy_flash = Some("Clipboard empty / unavailable".into());
+            }
+            return;
+        }
+        if let Some(text) = clipboard::paste_text() {
+            // Multi-line paste: keep newlines as spaces for single-line bar, or keep \n
+            let cleaned = text.replace('\r', "");
+            self.input_insert_str(&cleaned);
+            self.pane_focus = PaneFocus::Prompt;
+            self.copy_flash = Some(format!("Pasted {} chars", cleaned.chars().count()));
+        } else {
+            self.copy_flash = Some(
+                "Clipboard empty — use terminal Shift+Insert or middle-click for PRIMARY".into(),
+            );
+        }
+    }
+
+    /// Insert a string at the input cursor (normal mode).
+    pub fn input_insert_str(&mut self, s: &str) {
+        if matches!(self.input_mode, InputMode::Secure { .. }) {
+            if let InputMode::Secure { buffer, .. } = &mut self.input_mode {
+                let mut chars: Vec<char> = buffer.chars().collect();
+                let pos = self.input_cursor.min(chars.len());
+                for (i, c) in s.chars().enumerate() {
+                    chars.insert(pos + i, c);
+                }
+                *buffer = chars.into_iter().collect();
+                self.input_cursor = pos + s.chars().count();
+            }
+            return;
+        }
+        let mut chars: Vec<char> = self.input.chars().collect();
+        let pos = self.input_cursor.min(chars.len());
+        for (i, c) in s.chars().enumerate() {
+            chars.insert(pos + i, c);
+        }
+        self.input = chars.into_iter().collect();
+        self.input_cursor = pos + s.chars().count();
+    }
+
+    /// Map mouse Y within the chat area to a transcript line index, if any.
+    pub fn line_index_at_mouse(&self, col: u16, row: u16) -> Option<usize> {
+        let (x, y, w, h) = self.chat_area?;
+        if col < x || col >= x.saturating_add(w) || row < y || row >= y.saturating_add(h) {
+            return None;
+        }
+        // Inner content starts at y+1 (border), height-2 usable rows.
+        let inner_y = y.saturating_add(1);
+        let inner_h = h.saturating_sub(2) as usize;
+        if inner_h == 0 || row < inner_y {
+            return None;
+        }
+        let row_in = (row - inner_y) as usize;
+        if row_in >= inner_h {
+            return None;
+        }
+        let total = self.lines.len();
+        let max_scroll = self.max_chat_scroll();
+        let scroll = self.chat_scroll.min(max_scroll);
+        let end = total.saturating_sub(scroll);
+        let start = end.saturating_sub(inner_h);
+        let pad = inner_h.saturating_sub(end.saturating_sub(start));
+        if row_in < pad {
+            return None; // empty padding at top
+        }
+        let idx = start + (row_in - pad);
+        if idx < total {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    pub fn point_in_rect(col: u16, row: u16, area: Option<(u16, u16, u16, u16)>) -> bool {
+        let Some((x, y, w, h)) = area else {
+            return false;
+        };
+        col >= x && col < x.saturating_add(w) && row >= y && row < y.saturating_add(h)
+    }
+
+    pub fn on_mouse(&mut self, ev: MouseEvent) {
+        // Modals: ignore mouse for now (keyboard-first)
+        if !matches!(self.view, View::Chat) {
+            return;
+        }
+        let col = ev.column;
+        let row = ev.row;
+        match ev.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_chat(3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_chat(-3);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if Self::point_in_rect(col, row, self.input_area) {
+                    self.focus_prompt();
+                    return;
+                }
+                if let Some(idx) = self.line_index_at_mouse(col, row) {
+                    self.pane_focus = PaneFocus::Scrollback;
+                    self.selection = Some(LineSelection::single(idx));
+                    self.stick_to_bottom = false;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(idx) = self.line_index_at_mouse(col, row) {
+                    self.pane_focus = PaneFocus::Scrollback;
+                    if let Some(sel) = self.selection.as_mut() {
+                        sel.cursor = idx;
+                    } else {
+                        self.selection = Some(LineSelection::single(idx));
+                    }
+                    self.ensure_selection_visible();
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // no-op; selection already set
+            }
+            MouseEventKind::Down(MouseButton::Middle) => {
+                // Linux PRIMARY paste into prompt when available (arboard has no PRIMARY on all platforms)
+                // Fall through to CLIPBOARD paste as best-effort.
+                if Self::point_in_rect(col, row, self.input_area)
+                    || self.pane_focus == PaneFocus::Prompt
+                {
+                    self.paste_into_input();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn on_paste_event(&mut self, text: String) {
+        if !matches!(self.view, View::Chat) {
+            return;
+        }
+        // Bracketed paste → input (secure or normal)
+        let cleaned = text.replace('\r', "");
+        self.input_insert_str(&cleaned);
+        self.pane_focus = PaneFocus::Prompt;
     }
 
     pub fn transcript_lines(&self) -> Vec<TranscriptLine> {
@@ -989,25 +1367,145 @@ impl App {
             let _ = is_setup;
         }
 
-        // Input bar chords (work in normal + secure modes)
+        // Global Ctrl chords available in chat (prompt-oriented unless noted).
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('u') | KeyCode::Char('U') => {
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    // Paste into composer (Grok Build Ctrl+V)
+                    self.paste_into_input();
+                    return;
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    // Copy selection / last assistant (works from either pane)
+                    self.copy_selection();
+                    return;
+                }
+                KeyCode::Char('u') | KeyCode::Char('U')
+                    if self.pane_focus == PaneFocus::Prompt
+                        || matches!(self.input_mode, InputMode::Secure { .. }) =>
+                {
                     self.input_clear();
                     return;
                 }
-                KeyCode::Char('a') | KeyCode::Char('A') => {
+                KeyCode::Char('a') | KeyCode::Char('A')
+                    if self.pane_focus == PaneFocus::Prompt
+                        || matches!(self.input_mode, InputMode::Secure { .. }) =>
+                {
                     self.input_home();
                     return;
                 }
-                KeyCode::Char('e') | KeyCode::Char('E') => {
-                    // Ctrl+E = end of input bar (not End chat scroll)
-                    if matches!(self.input_mode, InputMode::Secure { .. })
-                        || matches!(self.view, View::Chat)
-                    {
-                        self.input_end();
-                        return;
+                KeyCode::Char('e') | KeyCode::Char('E')
+                    if self.pane_focus == PaneFocus::Prompt
+                        || matches!(self.input_mode, InputMode::Secure { .. }) =>
+                {
+                    self.input_end();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Tab toggles controllable panes (scrollback ↔ prompt), Grok Build–style.
+        if matches!(self.view, View::Chat)
+            && matches!(self.input_mode, InputMode::Normal)
+            && key.code == KeyCode::Tab
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            self.toggle_pane_focus();
+            return;
+        }
+
+        // Scrollback-focused navigation: select / highlight / copy (not typing).
+        if matches!(self.view, View::Chat)
+            && matches!(self.input_mode, InputMode::Normal)
+            && self.pane_focus == PaneFocus::Scrollback
+        {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char(' ') => {
+                    // Esc/Space return to prompt (Esc does not quit while scrollback focused)
+                    self.focus_prompt();
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.move_selection(-1, shift);
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.move_selection(1, shift);
+                    return;
+                }
+                KeyCode::PageUp => {
+                    self.move_selection(-12, shift);
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.move_selection(12, shift);
+                    return;
+                }
+                KeyCode::Home => {
+                    if !self.lines.is_empty() {
+                        let idx = 0;
+                        if shift {
+                            if let Some(sel) = self.selection.as_mut() {
+                                sel.cursor = idx;
+                            } else {
+                                self.selection = Some(LineSelection::single(idx));
+                            }
+                        } else {
+                            self.selection = Some(LineSelection::single(idx));
+                        }
+                        self.ensure_selection_visible();
                     }
+                    return;
+                }
+                KeyCode::End => {
+                    if !self.lines.is_empty() {
+                        let idx = self.lines.len() - 1;
+                        if shift {
+                            if let Some(sel) = self.selection.as_mut() {
+                                sel.cursor = idx;
+                            } else {
+                                self.selection = Some(LineSelection::single(idx));
+                            }
+                        } else {
+                            self.selection = Some(LineSelection::single(idx));
+                        }
+                        self.ensure_selection_visible();
+                    }
+                    return;
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y')
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.copy_selection();
+                    return;
+                }
+                KeyCode::Char('c')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    // Copy when scrollback focused; don't quit
+                    self.copy_selection();
+                    return;
+                }
+                KeyCode::Enter => {
+                    // Copy selection as the primary "action" on Enter in scrollback
+                    self.copy_selection();
+                    return;
+                }
+                // Any printable character auto-focuses the prompt and types (Grok simple mode)
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    self.focus_prompt();
+                    self.input_insert_char(c);
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.focus_prompt();
+                    self.input_backspace();
+                    return;
                 }
                 _ => {}
             }
@@ -1092,6 +1590,12 @@ impl App {
                     self.open_identities();
                 }
                 KeyCode::Esc => {
+                    // Double-purpose: if selection active, clear it; else quit
+                    if self.selection.is_some() {
+                        self.selection = None;
+                        self.copy_flash = Some("Selection cleared".into());
+                        return;
+                    }
                     self.should_quit = true;
                 }
                 KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1099,7 +1603,7 @@ impl App {
                     self.config.oscar_config.ui.show_thinking = self.show_thinking;
                     self.refresh_status();
                 }
-                // Chat scroll: PageUp/Up = older · PageDown/Down/End = newer · End pins bottom
+                // Chat scroll while prompt focused (Grok: PgUp/PgDn scroll without changing focus)
                 KeyCode::PageUp => {
                     self.scroll_chat(12);
                 }
@@ -1111,6 +1615,15 @@ impl App {
                 }
                 KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.scroll_chat(-3);
+                }
+                // Up/Down with empty input: jump into scrollback selection (discoverable)
+                KeyCode::Up if self.input.is_empty() && !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.focus_scrollback();
+                    self.move_selection(-1, false);
+                }
+                KeyCode::Down if self.input.is_empty() && !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.focus_scrollback();
+                    self.move_selection(1, false);
                 }
                 KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     // Furthest allowed back (cutoff), not infinite history
@@ -1181,12 +1694,48 @@ impl App {
                     if line == "/help" {
                         self.push_line(
                             LineKind::System,
-                            "/settings · /provider · /identities · /skills · /mcp · /thinking · /context · /compact · /history · /new · /resume · /quit",
+                            "/settings · /provider · /identities · /skills · /mcp · /thinking · /context · /compact · /history · /new · /resume · /copy · /quit",
                         );
                         self.push_line(
                             LineKind::System,
-                            "Input: Ctrl+A start · Ctrl+E end · Ctrl+U clear · Settings Ctrl+, · Identities Ctrl+I",
+                            "Panes: Tab = chat↔input · ↑↓ select lines · Shift+↑↓ extend · y/Enter/Ctrl+Y copy · Ctrl+V paste",
                         );
+                        self.push_line(
+                            LineKind::System,
+                            "Input: Ctrl+A start · Ctrl+E end · Ctrl+U clear · Settings Ctrl+, · Identities Ctrl+I · mouse click/drag select",
+                        );
+                        return;
+                    }
+                    // /copy [n] — Grok Build–style copy last (or Nth) assistant reply
+                    if line == "/copy" {
+                        self.copy_nth_assistant(1);
+                        return;
+                    }
+                    if let Some(rest) = line.strip_prefix("/copy ") {
+                        let rest = rest.trim();
+                        if rest.is_empty() {
+                            self.copy_nth_assistant(1);
+                            return;
+                        }
+                        if let Ok(n) = rest.parse::<usize>() {
+                            self.copy_nth_assistant(n);
+                            return;
+                        }
+                        // /copy path — write selection/last assistant to file
+                        if let Some(text) = self.selection_text() {
+                            match std::fs::write(rest, &text) {
+                                Ok(()) => self.push_line(
+                                    LineKind::System,
+                                    format!("Wrote {} bytes → {rest}", text.len()),
+                                ),
+                                Err(e) => self.push_line(
+                                    LineKind::Error,
+                                    format!("Write failed: {e}"),
+                                ),
+                            }
+                        } else {
+                            self.push_line(LineKind::System, "Nothing to copy.");
+                        }
                         return;
                     }
                     if line == "/new" {
@@ -1436,6 +1985,14 @@ impl App {
                 self.view = View::Chat;
                 self.open_identities();
                 return;
+            }
+            // y / Ctrl+Y — copy raw TOML when viewing Raw config (Grok-style copy)
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if pane.category() == crate::settings::SettingsCategory::RawConfig {
+                    let raw = pane.raw_toml();
+                    let outcome = crate::clipboard::copy_text(&raw);
+                    pane.flash = Some(outcome.message);
+                }
             }
             _ => {}
         }
@@ -1754,7 +2311,13 @@ pub async fn run_tui(
 ) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Controllable panes: mouse select/scroll + bracketed paste (Grok Build–style).
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1775,7 +2338,12 @@ pub async fn run_tui(
     let _ = transcript_tx.send(app.transcript_lines()).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     result
 }
@@ -1885,8 +2453,12 @@ async fn run_loop(
         }
 
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                app.on_key(key);
+            match event::read()? {
+                Event::Key(key) => app.on_key(key),
+                Event::Mouse(m) => app.on_mouse(m),
+                Event::Paste(text) => app.on_paste_event(text),
+                Event::Resize(_, _) => {}
+                _ => {}
             }
         }
     }

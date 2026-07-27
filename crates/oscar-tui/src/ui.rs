@@ -1,4 +1,4 @@
-use crate::app::{App, LineKind, View};
+use crate::app::{App, LineKind, PaneFocus, View};
 use crate::identities::IdentitiesPane;
 use crate::input::InputMode;
 use crate::settings::{ItemKind, SettingsCategory, SettingsPane};
@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -18,6 +18,10 @@ pub fn draw(f: &mut Frame, app: &App) {
             Constraint::Length(3),
         ])
         .split(f.area());
+
+    // Cache pane rects for mouse hit-testing (controllable panes).
+    app.chat_area = Some((chunks[1].x, chunks[1].y, chunks[1].width, chunks[1].height));
+    app.input_area = Some((chunks[2].x, chunks[2].y, chunks[2].width, chunks[2].height));
 
     draw_status(f, chunks[0], app);
     draw_chat(f, chunks[1], app);
@@ -131,18 +135,40 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &App) {
         .map(|_| Line::from(Span::raw("")))
         .collect();
 
-    for l in slice {
-        visible.push(format_chat_line(l));
+    let focus_scroll = app.pane_focus == PaneFocus::Scrollback;
+    for (offset, l) in slice.iter().enumerate() {
+        let abs_idx = start + offset;
+        let selected = app
+            .selection
+            .map(|s| s.contains(abs_idx))
+            .unwrap_or(false);
+        let is_cursor = app
+            .selection
+            .map(|s| s.cursor == abs_idx)
+            .unwrap_or(false);
+        visible.push(format_chat_line(l, selected, is_cursor && focus_scroll));
     }
 
+    let sel_hint = if let Some(sel) = app.selection {
+        format!(" · {} line(s) selected · y/Enter copy ", sel.line_count())
+    } else {
+        String::new()
+    };
+    let focus_hint = if focus_scroll {
+        " focused · ↑↓ select · Shift extend · Tab/Esc prompt "
+    } else {
+        " Tab focus · click/drag select "
+    };
     let title = if scroll == 0 {
-        format!(" chat · newest · {} lines ", total)
+        format!(" chat · newest · {total} lines{focus_hint}{sel_hint}")
     } else {
         format!(
-            " chat · ↑{scroll} back (max {max_scroll}) · PgUp/PgDn · End=bottom "
+            " chat · ↑{scroll} back (max {max_scroll}) · PgUp/PgDn{focus_hint}{sel_hint}"
         )
     };
-    let border = if scroll == 0 {
+    let border = if focus_scroll {
+        Style::default().fg(Color::Cyan)
+    } else if scroll == 0 {
         Style::default().fg(Color::DarkGray)
     } else {
         Style::default().fg(Color::Yellow)
@@ -160,52 +186,107 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Grok Build–style line chrome: thinking blocks dim, tools as cards, clear roles.
-fn format_chat_line(l: &crate::app::ChatLine) -> Line<'static> {
+/// `selected` / `cursor` control highlight for clipboard selection.
+fn format_chat_line(
+    l: &crate::app::ChatLine,
+    selected: bool,
+    cursor: bool,
+) -> Line<'static> {
+    let sel_bg = if cursor {
+        Color::Cyan
+    } else if selected {
+        Color::Rgb(40, 60, 80)
+    } else {
+        Color::Reset
+    };
+    let apply_sel = |style: Style| -> Style {
+        if selected || cursor {
+            let fg = if cursor {
+                Color::Black
+            } else {
+                style.fg.unwrap_or(Color::White)
+            };
+            style.fg(fg).bg(sel_bg).add_modifier(if cursor {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            })
+        } else {
+            style
+        }
+    };
+    let prefix = if cursor {
+        "▸ "
+    } else if selected {
+        "· "
+    } else {
+        ""
+    };
+
     match l.kind {
         LineKind::User => Line::from(vec![
             Span::styled(
-                "you  │ ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                format!("{prefix}you  │ "),
+                apply_sel(
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ),
-            Span::styled(l.text.clone(), Style::default().fg(Color::Green)),
+            Span::styled(
+                l.text.clone(),
+                apply_sel(Style::default().fg(Color::Green)),
+            ),
         ]),
         LineKind::Assistant => Line::from(vec![
             Span::styled(
-                "oscar │ ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                format!("{prefix}oscar │ "),
+                apply_sel(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ),
-            Span::styled(l.text.clone(), Style::default().fg(Color::White)),
+            Span::styled(
+                l.text.clone(),
+                apply_sel(Style::default().fg(Color::White)),
+            ),
         ]),
         LineKind::Thinking => {
             // Header vs body (│ …)
             let is_body = l.text.starts_with('│');
             if is_body {
                 Line::from(vec![
-                    Span::styled("      ", Style::default()),
+                    Span::styled(
+                        format!("{prefix}      "),
+                        apply_sel(Style::default()),
+                    ),
                     Span::styled(
                         l.text.clone(),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
+                        apply_sel(
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        ),
                     ),
                 ])
             } else {
                 Line::from(vec![
                     Span::styled(
-                        "think│ ",
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
+                        format!("{prefix}think│ "),
+                        apply_sel(
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                     ),
                     Span::styled(
                         l.text.clone(),
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::ITALIC),
+                        apply_sel(
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::ITALIC),
+                        ),
                     ),
                 ])
             }
@@ -223,34 +304,48 @@ fn format_chat_line(l: &crate::app::ChatLine) -> Line<'static> {
             };
             if is_detail {
                 Line::from(vec![
-                    Span::styled("      ", Style::default()),
-                    Span::styled(l.text.clone(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{prefix}      "),
+                        apply_sel(Style::default()),
+                    ),
+                    Span::styled(
+                        l.text.clone(),
+                        apply_sel(Style::default().fg(Color::DarkGray)),
+                    ),
                 ])
             } else {
                 Line::from(vec![
                     Span::styled(
-                        mark,
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        format!("{prefix}{mark}"),
+                        apply_sel(Style::default().fg(color).add_modifier(Modifier::BOLD)),
                     ),
-                    Span::styled(l.text.clone(), Style::default().fg(color)),
+                    Span::styled(l.text.clone(), apply_sel(Style::default().fg(color))),
                 ])
             }
         }
         LineKind::System => Line::from(vec![
             Span::styled(
-                "sys  │ ",
-                Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
+                format!("{prefix}sys  │ "),
+                apply_sel(
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ),
-            Span::styled(l.text.clone(), Style::default().fg(Color::Blue)),
+            Span::styled(
+                l.text.clone(),
+                apply_sel(Style::default().fg(Color::Blue)),
+            ),
         ]),
         LineKind::Error => Line::from(vec![
             Span::styled(
-                "err  │ ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                format!("{prefix}err  │ "),
+                apply_sel(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             ),
-            Span::styled(l.text.clone(), Style::default().fg(Color::Red)),
+            Span::styled(
+                l.text.clone(),
+                apply_sel(Style::default().fg(Color::Red)),
+            ),
         ]),
     }
 }
@@ -316,14 +411,19 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    let prompt_focused = app.pane_focus == PaneFocus::Prompt
+        || matches!(app.input_mode, InputMode::Secure { .. });
+
     let title = match &app.input_mode {
         InputMode::Normal => {
             if app.streaming {
                 " input (streaming — Esc to cancel) ".to_string()
+            } else if !prompt_focused {
+                " input · Tab to type · chat focused ".to_string()
             } else if app.show_idle_input_hint() {
-                " input · tip ".to_string()
+                " input · tip · Tab chat ".to_string()
             } else {
-                " input ".to_string()
+                " input · focused ".to_string()
             }
         }
         InputMode::Secure {
@@ -334,12 +434,12 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
                 .get(*kind_index)
                 .map(|k| format!("{k:?}"))
                 .unwrap_or_else(|| "secret".into());
-            format!(" SECURE · enter {kind} · {} · Esc cancel ", auth.cloud)
+            format!(" SECURE · enter {kind} · {} · Esc cancel · Ctrl+V paste ", auth.cloud)
         }
     };
 
     let (text_style, border_fg, show_cursor) = match &app.input_mode {
-        InputMode::Normal if app.show_idle_input_hint() => {
+        InputMode::Normal if app.show_idle_input_hint() && prompt_focused => {
             // Grok Build–style: dim cycling tooltip inside the empty input field
             let hint = app.idle_hint.current();
             let line = Line::from(vec![
@@ -355,10 +455,13 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(title)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .border_style(Style::default().fg(Color::White)),
             );
             f.render_widget(para, area);
             return;
+        }
+        InputMode::Normal if !prompt_focused => {
+            (Style::default().fg(Color::DarkGray), Color::DarkGray, false)
         }
         InputMode::Normal => (Style::default().fg(Color::White), Color::White, true),
         InputMode::Secure { .. } => (Style::default().fg(Color::Yellow), Color::Yellow, true),
@@ -369,11 +472,16 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
         InputMode::Normal => format!("> {}", app.input),
     };
     let title_extra = if show_cursor {
-        " · ^A start ^E end ^U clear "
+        " · ^A start ^E end ^U clear · ^V paste · ^Y copy "
     } else {
         ""
     };
-    let full_title = format!("{title}{title_extra}");
+    let flash = app
+        .copy_flash
+        .as_ref()
+        .map(|s| format!(" · {s} "))
+        .unwrap_or_default();
+    let full_title = format!("{title}{title_extra}{flash}");
     let para = Paragraph::new(display)
         .style(text_style)
         .block(
@@ -472,7 +580,7 @@ fn draw_settings_modal(f: &mut Frame, area: Rect, pane: &SettingsPane) {
             " Provider: xAI/OpenCode = browser sign-in · OpenAI/Claude = API key · chat blocked until ready "
         }
         SettingsCategory::RawConfig => {
-            " Raw config: → focus · ↑↓/PgUp/PgDn scroll · Home/End · secrets stay in keychain "
+            " Raw config: → focus · ↑↓ scroll · y/Ctrl+Y copy TOML · secrets stay in keychain "
         }
         _ => " ↑↓ move · →/Enter open · ← back · Esc close · ~/.config/oscar/config.toml ",
     };
