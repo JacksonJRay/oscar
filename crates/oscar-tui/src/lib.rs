@@ -3,6 +3,7 @@
 mod app;
 mod identities;
 mod input;
+mod provider_pane;
 mod settings;
 mod ui;
 

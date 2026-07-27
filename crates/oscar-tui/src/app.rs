@@ -1,5 +1,6 @@
 use crate::identities::IdentitiesPane;
 use crate::input::{IdleHintRotator, InputMode};
+use crate::provider_pane::{ProviderPane, ProviderPaneAction};
 use crate::settings::{SettingsPane, ToolCatalogEntry};
 use crate::ui;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -78,6 +79,8 @@ pub enum View {
     Chat,
     Settings(SettingsPane),
     Identities(IdentitiesPane),
+    /// Dedicated LLM provider setup (default, keys, URLs, custom).
+    Provider(ProviderPane),
 }
 
 pub struct App {
@@ -183,7 +186,7 @@ impl App {
         app
     }
 
-    /// Open Settings → Provider (used on first run / missing key).
+    /// Open dedicated Provider setup pane (first run / missing key / /provider).
     pub fn open_provider_setup(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
         // Never leave chat stuck in streaming when forcing setup.
@@ -193,13 +196,29 @@ impl App {
         self.push_line(LineKind::System, reason);
         self.push_line(
             LineKind::System,
-            "Provider setup: ↑↓ move · → open · Enter auth · xAI/OpenCode = browser sign-in · OpenAI/Claude = API key. Chat is disabled until ready.",
+            "Providers: ↑↓ pick · → actions · Enter run · set default · open console · paste key. Chat disabled until a key is stored.",
         );
-        let pane = SettingsPane::open_provider(
-            self.config.oscar_config.clone(),
-            self.config.tool_catalog.clone(),
-        );
-        self.view = View::Settings(pane);
+        let pane = ProviderPane::open(self.config.oscar_config.clone());
+        self.view = View::Provider(pane);
+    }
+
+    pub fn close_provider_pane(&mut self, save: bool) {
+        if let View::Provider(pane) = std::mem::replace(&mut self.view, View::Chat) {
+            if save || pane.dirty {
+                self.apply_config(pane.config.clone());
+                self.pending_config_save = Some(pane.config);
+                self.push_line(
+                    LineKind::System,
+                    format!(
+                        "Provider settings saved · default=`{}` · ready={}",
+                        self.config.provider,
+                        self.config.provider_ready
+                    ),
+                );
+            } else {
+                self.push_line(LineKind::System, "Provider setup closed.");
+            }
+        }
     }
 
     fn begin_provider_key_paste(&mut self, provider_id: String) {
@@ -926,6 +945,10 @@ impl App {
             self.on_settings_key(key);
             return;
         }
+        if matches!(self.view, View::Provider(_)) {
+            self.on_provider_key(key);
+            return;
+        }
         if matches!(self.view, View::Identities(_)) {
             self.on_identities_key(key);
             return;
@@ -1258,6 +1281,11 @@ impl App {
             // → drill into menu · ← drill out
             KeyCode::Right | KeyCode::Char('l') => {
                 if pane.focus == SettingsFocus::Categories {
+                    // Provider category opens dedicated provider UI
+                    if pane.category() == crate::settings::SettingsCategory::Provider {
+                        self.open_provider_setup("Provider setup");
+                        return;
+                    }
                     pane.drill_in();
                 } else {
                     // In items: Right cycles enums / toggles forward
@@ -1355,7 +1383,7 @@ impl App {
         }
     }
 
-    /// Handle one-shot settings actions (provider auth) after activate/drill.
+    /// Handle one-shot settings actions (legacy settings provider category).
     fn handle_settings_action(&mut self) {
         use crate::settings::{provider_auth_url, SettingsAction};
         let action = match &mut self.view {
@@ -1369,22 +1397,186 @@ impl App {
             }
             Some(SettingsAction::SignInProvider { provider_id }) => {
                 let url = provider_auth_url(&provider_id);
-                // Best-effort open browser for account sign-in.
                 let opened = open_browser_url(url);
                 self.close_settings(true);
                 self.push_line(
                     LineKind::System,
                     if opened {
                         format!(
-                            "Opened browser for `{provider_id}` sign-in ({url}). After you sign in and copy a key from the console, paste it in the secure bar."
+                            "Opened browser for `{provider_id}` ({url}). Copy an API key, then paste in the secure bar."
                         )
                     } else {
                         format!(
-                            "Open this URL in your browser to sign in to `{provider_id}`: {url} — then paste the console API key in the secure bar."
+                            "Open {url} for `{provider_id}`, copy an API key, then paste in the secure bar."
                         )
                     },
                 );
                 self.begin_provider_key_paste(provider_id);
+            }
+            None => {}
+        }
+    }
+
+    fn on_provider_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crate::provider_pane::{ProviderFocus, ProviderPaneAction};
+
+        // Editing model / URL captures keys first
+        let editing = matches!(&self.view, View::Provider(p) if p.edit.is_some());
+        if editing {
+            match key.code {
+                KeyCode::Esc => {
+                    if let View::Provider(p) = &mut self.view {
+                        p.edit = None;
+                        p.flash = Some("edit cancelled".into());
+                    }
+                }
+                KeyCode::Enter => {
+                    if let View::Provider(p) = &mut self.view {
+                        p.activate(); // commits edit
+                    }
+                    self.dispatch_provider_pending();
+                }
+                KeyCode::Backspace => {
+                    if let View::Provider(p) = &mut self.view {
+                        p.edit_backspace();
+                    }
+                }
+                KeyCode::Left => {
+                    if let View::Provider(p) = &mut self.view {
+                        p.edit_left();
+                    }
+                }
+                KeyCode::Right => {
+                    if let View::Provider(p) = &mut self.view {
+                        p.edit_right();
+                    }
+                }
+                KeyCode::Home => {
+                    if let View::Provider(p) = &mut self.view {
+                        p.edit_home();
+                    }
+                }
+                KeyCode::End => {
+                    if let View::Provider(p) = &mut self.view {
+                        p.edit_end();
+                    }
+                }
+                KeyCode::Char('u') | KeyCode::Char('U')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    if let View::Provider(p) = &mut self.view {
+                        p.edit_clear();
+                    }
+                }
+                KeyCode::Char('a') | KeyCode::Char('A')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    if let View::Provider(p) = &mut self.view {
+                        p.edit_home();
+                    }
+                }
+                KeyCode::Char('e') | KeyCode::Char('E')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    if let View::Provider(p) = &mut self.view {
+                        p.edit_end();
+                    }
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let View::Provider(p) = &mut self.view {
+                        p.edit_insert(c);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        let View::Provider(ref mut pane) = self.view else {
+            return;
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                if pane.drill_out() {
+                    self.close_provider_pane(true);
+                }
+            }
+            KeyCode::Char('q') if key.modifiers.is_empty() => {
+                self.close_provider_pane(true);
+            }
+            KeyCode::Up | KeyCode::Char('k') => match pane.focus {
+                ProviderFocus::List => pane.move_list(-1),
+                ProviderFocus::Actions => pane.move_action(-1),
+            },
+            KeyCode::Down | KeyCode::Char('j') => match pane.focus {
+                ProviderFocus::List => pane.move_list(1),
+                ProviderFocus::Actions => pane.move_action(1),
+            },
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+                if pane.focus == ProviderFocus::List {
+                    pane.drill_in();
+                } else {
+                    pane.activate();
+                    self.dispatch_provider_pending();
+                    return;
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
+                let _ = pane.drill_out();
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                pane.activate();
+                self.dispatch_provider_pending();
+            }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let cfg = pane.config.clone();
+                pane.dirty = false;
+                pane.flash = Some("saved".into());
+                self.apply_config(cfg.clone());
+                self.pending_config_save = Some(cfg);
+            }
+            _ => {}
+        }
+    }
+
+    fn dispatch_provider_pending(&mut self) {
+        let pending = match &mut self.view {
+            View::Provider(p) => p.take_pending(),
+            _ => None,
+        };
+        let cfg_snapshot = match &self.view {
+            View::Provider(p) => Some(p.config.clone()),
+            _ => None,
+        };
+        match pending {
+            Some(ProviderPaneAction::PasteApiKey { provider_id }) => {
+                if let Some(cfg) = cfg_snapshot {
+                    self.apply_config(cfg.clone());
+                    self.pending_config_save = Some(cfg);
+                }
+                self.view = View::Chat;
+                self.begin_provider_key_paste(provider_id);
+            }
+            Some(ProviderPaneAction::OpenBrowser { url, label }) => {
+                let opened = open_browser_url(&url);
+                self.push_line(
+                    LineKind::System,
+                    if opened {
+                        format!("Opened browser: {label} — {url}")
+                    } else {
+                        format!("Open in browser: {url} ({label})")
+                    },
+                );
+            }
+            Some(ProviderPaneAction::ConfigChanged) => {
+                if let Some(cfg) = cfg_snapshot {
+                    self.apply_config(cfg.clone());
+                    self.pending_config_save = Some(cfg);
+                }
+            }
+            Some(ProviderPaneAction::Close) => {
+                self.close_provider_pane(true);
             }
             None => {}
         }

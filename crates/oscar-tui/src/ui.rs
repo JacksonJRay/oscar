@@ -26,6 +26,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     match &app.view {
         View::Settings(pane) => draw_settings_modal(f, f.area(), pane),
         View::Identities(pane) => draw_identities_modal(f, f.area(), pane, app.identity_detail),
+        View::Provider(pane) => draw_provider_modal(f, f.area(), pane),
         View::Chat => {}
     }
 }
@@ -52,7 +53,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let settings_hint = match &app.view {
         View::Settings(_) => "  │ SETTINGS ",
         View::Identities(_) => "  │ IDENTITIES ",
-        View::Chat => "  │ /settings /mcp /context ",
+        View::Provider(_) => "  │ PROVIDERS ",
+        View::Chat => "  │ /settings /provider /mcp ",
     };
     let mut spans = vec![
         Span::styled(
@@ -255,13 +257,46 @@ fn format_chat_line(l: &crate::app::ChatLine) -> Line<'static> {
 
 fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     if matches!(app.view, View::Settings(_)) {
-        let para = Paragraph::new(" settings open · Esc save & close · ↑↓ items · ←→ categories ")
+        let para = Paragraph::new(" settings · ↑↓ move · → open · ← back · Esc close ")
             .style(Style::default().fg(Color::Yellow))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" input (paused) ")
                     .border_style(Style::default().fg(Color::Yellow)),
+            );
+        f.render_widget(para, area);
+        return;
+    }
+    if let View::Provider(pane) = &app.view {
+        if let Some((buf, cur, field)) = pane.edit_display() {
+            let line = format!("> {buf}");
+            let para = Paragraph::new(line)
+                .style(Style::default().fg(Color::Cyan))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" edit {field} · Enter save · Esc cancel "))
+                        .border_style(Style::default().fg(Color::Cyan)),
+                );
+            f.render_widget(para, area);
+            let col = 2u16.saturating_add(cur.min(u16::MAX as usize) as u16);
+            let x = area.x.saturating_add(1).saturating_add(col.min(area.width.saturating_sub(2)));
+            let y = area.y.saturating_add(1);
+            f.set_cursor_position((x, y));
+            return;
+        }
+        let hint = pane
+            .flash
+            .clone()
+            .unwrap_or_else(|| "↑↓ · → actions · Enter · Esc close".into());
+        let para = Paragraph::new(hint)
+            .style(Style::default().fg(Color::Magenta))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" providers ")
+                    .border_style(Style::default().fg(Color::Magenta)),
             );
         f.render_widget(para, area);
         return;
@@ -696,6 +731,202 @@ fn validity_style(v: Validity, selected: bool) -> Style {
         Validity::Missing => Style::default().fg(Color::DarkGray),
         Validity::Unknown => Style::default().fg(Color::Cyan),
     }
+}
+
+fn draw_provider_modal(f: &mut Frame, area: Rect, pane: &crate::provider_pane::ProviderPane) {
+    use crate::provider_pane::{ProviderFocus, ProviderPane};
+
+    let area = centered_rect(88, 78, area);
+    f.render_widget(Clear, area);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" LLM providers · set default · open console · paste key · custom URL ")
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(6),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+
+    let def = &pane.config.provider.id;
+    let ready = ProviderPane::has_key(def);
+    let header = format!(
+        " Default: `{def}`  ·  ready={}  ·  model={}  ·  base={}",
+        if ready { "yes" } else { "NO" },
+        pane.config
+            .provider
+            .model
+            .as_deref()
+            .unwrap_or("(provider default)"),
+        pane.config
+            .provider
+            .base_url
+            .as_deref()
+            .unwrap_or("(provider default)"),
+    );
+    f.render_widget(
+        Paragraph::new(header).style(Style::default().fg(Color::White)),
+        body[0],
+    );
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(body[1]);
+
+    // Left: provider list
+    let list_focus = pane.focus == ProviderFocus::List;
+    let list_items: Vec<ListItem> = pane
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let selected = i == pane.list_idx;
+            let is_def = pane.is_default(&r.id);
+            let has = if r.id == "__add_custom__" {
+                false
+            } else {
+                ProviderPane::has_key(&r.id)
+            };
+            let mark = if r.id == "__add_custom__" {
+                "  "
+            } else if has {
+                "● "
+            } else {
+                "○ "
+            };
+            let def_mark = if is_def { " ★DEFAULT" } else { "" };
+            let prefix = if selected && list_focus {
+                "▸ "
+            } else if selected {
+                "· "
+            } else {
+                "  "
+            };
+            let line = format!("{prefix}{mark}{:<16}{def_mark}", r.name);
+            let style = if selected && list_focus {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD)
+            } else if selected {
+                Style::default().fg(Color::Magenta)
+            } else if has {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+    let list = List::new(list_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(if list_focus {
+                " providers · focused "
+            } else {
+                " providers "
+            })
+            .border_style(Style::default().fg(if list_focus {
+                Color::Magenta
+            } else {
+                Color::DarkGray
+            })),
+    );
+    f.render_widget(list, cols[0]);
+
+    // Right: actions + details
+    let act_focus = pane.focus == ProviderFocus::Actions;
+    let mut action_lines: Vec<ListItem> = Vec::new();
+    if let Some(row) = pane.selected() {
+        action_lines.push(
+            ListItem::new(format!("── {} ({}) ", row.name, row.id)).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+        action_lines.push(
+            ListItem::new(format!("  {}", row.auth_hint)).style(Style::default().fg(Color::Gray)),
+        );
+        action_lines.push(ListItem::new("").style(Style::default()));
+        let actions = pane.actions_for_selected();
+        for (i, a) in actions.iter().enumerate() {
+            let has = ProviderPane::has_key(&row.id);
+            let is_def = pane.is_default(&row.id);
+            let label = a.label(has, is_def, row.needs_account);
+            let selected = i == pane.action_idx;
+            let prefix = if selected && act_focus { "› " } else { "  " };
+            let style = if selected && act_focus {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else if selected {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            action_lines.push(ListItem::new(format!("{prefix}{label}")).style(style));
+        }
+        action_lines.push(ListItem::new("").style(Style::default()));
+        let model = if pane.is_default(&row.id) {
+            pane.config
+                .provider
+                .model
+                .clone()
+                .unwrap_or_else(|| row.default_model.clone())
+        } else {
+            row.default_model.clone()
+        };
+        let base = if pane.is_default(&row.id) {
+            pane.config
+                .provider
+                .base_url
+                .clone()
+                .unwrap_or_else(|| row.default_base.clone())
+        } else {
+            row.default_base.clone()
+        };
+        action_lines.push(
+            ListItem::new(format!("  model: {model}")).style(Style::default().fg(Color::Cyan)),
+        );
+        action_lines.push(
+            ListItem::new(format!("  url:   {base}")).style(Style::default().fg(Color::Cyan)),
+        );
+    }
+    let actions_list = List::new(action_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(if act_focus {
+                " actions · focused · ← back "
+            } else {
+                " actions · → open "
+            })
+            .border_style(Style::default().fg(if act_focus {
+                Color::White
+            } else {
+                Color::DarkGray
+            })),
+    );
+    f.render_widget(actions_list, cols[1]);
+
+    let footer = pane.flash.clone().unwrap_or_else(|| {
+        "xAI/OpenCode: open console → sign in → copy key → paste · OpenAI/Claude: paste API key"
+            .into()
+    });
+    f.render_widget(
+        Paragraph::new(footer)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::DarkGray)),
+        body[2],
+    );
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
