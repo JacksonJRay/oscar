@@ -215,6 +215,139 @@ pub struct NetworkInventory {
     pub subnets: Vec<SubnetEntry>,
     #[serde(default)]
     pub addresses: Vec<AddressEntry>,
+    /// AWS security groups / GCP firewall rules / Azure NSGs.
+    #[serde(default)]
+    pub security_groups: Vec<SecurityGroupEntry>,
+    /// AWS network ACLs (empty on GCP/Azure where firewall/NSG covers the role).
+    #[serde(default)]
+    pub nacls: Vec<NaclEntry>,
+    /// Route tables (AWS RT, Azure route table; GCP may use a synthetic global table).
+    #[serde(default)]
+    pub route_tables: Vec<RouteTableEntry>,
+    /// Individual routes for dest-CIDR / next-hop pattern search.
+    #[serde(default)]
+    pub routes: Vec<RouteEntry>,
+    /// Serverless functions (Lambda / Cloud Functions / Azure Functions).
+    #[serde(default)]
+    pub functions: Vec<FunctionEntry>,
+    /// Cross-cloud network services: peering, TGW, VPN, hybrid (DX/ER), private endpoints,
+    /// NAT/IGW, network shares, prefix lists, load balancers (when inventoried).
+    #[serde(default)]
+    pub services: Vec<NetworkServiceEntry>,
+}
+
+/// Unified network service row for pattern discovery (peering, TGW, VPN, hybrid, endpoints, …).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkServiceEntry {
+    pub id: String,
+    pub name: Option<String>,
+    /// Canonical type: peering | transit_gateway | vpn | hybrid | private_endpoint |
+    /// nat_gateway | internet_gateway | network_share | prefix_list | load_balancer | other
+    pub service_type: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub vpc_id: Option<String>,
+    /// Related resource ids (peer VPC, TGW, attachment, remote VNet, service name, …).
+    #[serde(default)]
+    pub related_ids: Vec<String>,
+    #[serde(default)]
+    pub cidrs: Vec<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl NetworkServiceEntry {
+    pub fn new(
+        id: impl Into<String>,
+        service_type: impl Into<String>,
+        name: Option<String>,
+        region: Option<&str>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name,
+            service_type: service_type.into(),
+            status: None,
+            vpc_id: None,
+            related_ids: vec![],
+            cidrs: vec![],
+            region: region.map(|s| s.to_string()),
+            description: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityGroupEntry {
+    pub id: String,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub vpc_id: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NaclEntry {
+    pub id: String,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub vpc_id: Option<String>,
+    #[serde(default)]
+    pub is_default: Option<bool>,
+    #[serde(default)]
+    pub region: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteTableEntry {
+    pub id: String,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub vpc_id: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Destination CIDRs / prefix lists summarized for search.
+    #[serde(default)]
+    pub destinations: Vec<String>,
+    /// Gateway / NAT / peering / instance targets summarized for search.
+    #[serde(default)]
+    pub targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteEntry {
+    /// Composite id (route-table + destination) when no native id.
+    pub id: String,
+    pub name: Option<String>,
+    pub route_table_id: String,
+    /// Destination CIDR, prefix list, or service endpoint.
+    pub destination: String,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub vpc_id: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionEntry {
+    pub id: String,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub runtime: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub vpc_id: Option<String>,
+    #[serde(default)]
+    pub arn_or_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

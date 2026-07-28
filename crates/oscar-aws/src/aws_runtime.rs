@@ -98,16 +98,27 @@ pub fn first_aws_profile_pref<'a>(
             }
         }
     }
-    profiles
+    let aws: Vec<_> = profiles
         .list()
         .iter()
-        .find(|p| p.cloud == Cloud::Aws)
-        .ok_or_else(|| {
-            oscar_tools::ToolResult::needs_auth(oscar_tools::auth_for(
-                Cloud::Aws,
-                "No AWS profile configured — call system.access.prepare with cloud=aws (+ account), or `oscar profiles add`",
-            ))
-        })
+        .filter(|p| p.cloud == Cloud::Aws)
+        .collect();
+    match aws.as_slice() {
+        [] => Err(oscar_tools::ToolResult::needs_auth(oscar_tools::auth_for(
+            Cloud::Aws,
+            "No AWS profile configured — call system.access.prepare with cloud=aws (+ account/label), or `oscar profiles add`",
+        ))),
+        [only] => Ok(*only),
+        many => {
+            let ids: Vec<_> = many.iter().map(|p| p.id.as_str()).collect();
+            Err(oscar_tools::ToolResult::error(format!(
+                "Multiple AWS profiles {} — refuse silent default. \
+                 If the user named an account/label, system.access.review then system.access.prepare (if missing) / system.access.select, \
+                 then re-call with profile_id. Do not use another profile as a substitute.",
+                ids.join(", ")
+            )))
+        }
+    }
 }
 
 /// Resolve AWS profile for live tools; falls back to ambient binary session shell.
@@ -126,9 +137,19 @@ pub fn resolve_aws_profile_pref(
     match first_aws_profile_pref(profiles, profile_id, preferred_profile_id) {
         Ok(p) => Ok(p.clone()),
         Err(e) if profile_id.is_some() => Err(e),
-        Err(_) => {
-            // Ambient SSO/instance-role session — no oscar profile required.
-            Ok(Profile::new(Cloud::Aws, "ambient", "ambient"))
+        Err(e) => {
+            // Only ambient-fallback when there are *zero* AWS profiles configured.
+            // Multi-profile ambiguity / auth errors must surface to the agent.
+            let aws_n = profiles
+                .list()
+                .iter()
+                .filter(|p| p.cloud == Cloud::Aws)
+                .count();
+            if aws_n == 0 {
+                Ok(Profile::new(Cloud::Aws, "ambient", "ambient"))
+            } else {
+                Err(e)
+            }
         }
     }
 }

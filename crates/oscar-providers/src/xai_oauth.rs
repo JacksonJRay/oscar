@@ -4,23 +4,21 @@
 //! 1. **Browser PKCE** (default) — loopback `http://127.0.0.1:<port>/callback`
 //! 2. **Device code** — headless / SSH (`oscar auth login --device`)
 //!
-//! Tokens live in `~/.config/oscar/auth.json` (mode 0600). Access tokens are also
-//! mirrored into the OS keychain under `oscar/provider/xai` so existing resolve
-//! paths keep working. Secrets never enter the chat transcript.
+//! Tokens live in the unified AuthStore (`~/.config/oscar/auth.json`, mode 0600)
+//! as `type: oauth` for provider `xai`. Access tokens are dual-written to the OS
+//! keychain under `oscar/provider/xai`. Secrets never enter the chat transcript.
 //!
 //! Public OIDC client id is the Grok Build CLI public client (embedded in the
 //! official binary; no client secret — PKCE only).
 
+use crate::auth_store::{self, AuthEntry};
 use oscar_core::Paths;
-use oscar_identity::store_provider_api_key;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -36,8 +34,12 @@ pub const XAI_API_BASE: &str = "https://api.x.ai/v1";
 pub const XAI_PUBLIC_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 
 /// Scopes for CLI/agent access + silent refresh.
+///
+/// Do **not** include `team:read` / `org:read` — xAI rejects them for User
+/// principals (`invalid_scope` / "not valid for User principals"), which broke
+/// SuperGrok device + browser login entirely.
 pub const XAI_SCOPES: &str =
-    "openid profile email offline_access api:access grok-cli:access team:read org:read";
+    "openid profile email offline_access api:access grok-cli:access";
 
 /// Provider ids that share the same Grok/xAI OAuth slot.
 pub fn is_xai_family(id: &str) -> bool {
@@ -52,14 +54,7 @@ pub fn xai_canonical_id() -> &'static str {
     "xai"
 }
 
-// ── Storage ──────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AuthFile {
-    /// provider_id → session (e.g. "xai")
-    #[serde(default)]
-    pub providers: BTreeMap<String, OAuthSession>,
-}
+// ── Session type (login UX + refresh) ────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthSession {
@@ -95,55 +90,84 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn auth_path(paths: &Paths) -> &Path {
-    &paths.auth_file
-}
-
-pub fn load_auth_file(paths: &Paths) -> AuthFile {
-    match fs::read_to_string(auth_path(paths)) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
-        Err(_) => AuthFile::default(),
+fn session_from_entry(e: &AuthEntry) -> Option<OAuthSession> {
+    match e {
+        AuthEntry::Oauth {
+            access,
+            refresh,
+            expires,
+            account_id,
+            email,
+            client_id,
+            issuer,
+            scope,
+            id_token,
+            token_type,
+            auth_mode,
+            updated_at,
+            ..
+        } => Some(OAuthSession {
+            access_token: access.clone(),
+            refresh_token: refresh.clone(),
+            id_token: id_token.clone(),
+            token_type: token_type.clone(),
+            expires_at: *expires,
+            scope: scope.clone(),
+            email: email.clone(),
+            user_id: account_id.clone(),
+            client_id: client_id.clone().unwrap_or_else(|| XAI_PUBLIC_CLIENT_ID.into()),
+            issuer: issuer.clone().unwrap_or_else(|| XAI_ISSUER.into()),
+            updated_at: updated_at.unwrap_or(0),
+            auth_mode: auth_mode.clone(),
+        }),
+        _ => None,
     }
 }
 
-pub fn save_auth_file(paths: &Paths, file: &AuthFile) -> Result<(), String> {
-    paths.ensure().map_err(|e| e.to_string())?;
-    let path = auth_path(paths);
-    let raw = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
-    fs::write(path, &raw).map_err(|e| format!("write auth.json: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+fn entry_from_session(s: &OAuthSession) -> AuthEntry {
+    AuthEntry::Oauth {
+        access: s.access_token.clone(),
+        refresh: s.refresh_token.clone(),
+        expires: s.expires_at,
+        account_id: s.user_id.clone(),
+        email: s.email.clone(),
+        client_id: Some(s.client_id.clone()),
+        issuer: Some(s.issuer.clone()),
+        scope: s.scope.clone(),
+        id_token: s.id_token.clone(),
+        token_type: s.token_type.clone(),
+        auth_mode: s.auth_mode.clone(),
+        updated_at: Some(s.updated_at),
+        metadata: BTreeMap::new(),
     }
-    Ok(())
 }
 
 pub fn clear_xai_oauth(paths: &Paths) -> Result<(), String> {
-    let mut file = load_auth_file(paths);
-    file.providers.remove(xai_canonical_id());
-    save_auth_file(paths, &file)
+    auth_store::remove(paths, xai_canonical_id())
 }
 
 pub fn oauth_status(paths: &Paths) -> Option<OAuthSession> {
-    load_auth_file(paths)
-        .providers
-        .get(xai_canonical_id())
-        .cloned()
+    auth_store::get(paths, xai_canonical_id()).and_then(|e| session_from_entry(&e))
 }
 
 // ── Token use / refresh ──────────────────────────────────────────────────────
 
-/// Valid bearer token for Grok/xAI API calls, refreshing if near expiry.
+/// Valid bearer token for Grok/xAI **OAuth / SuperGrok** calls, refreshing if near expiry.
+///
+/// Returns `Ok(None)` only when no OAuth entry exists (caller may use API key for payg).
+/// If an OAuth entry exists but is unusable, returns `Err` so we never silently use API key.
 pub async fn get_valid_xai_access_token(paths: &Paths) -> Result<Option<String>, String> {
-    let file = load_auth_file(paths);
-    let Some(mut rec) = file.providers.get(xai_canonical_id()).cloned() else {
+    let Some(mut rec) = oauth_status(paths) else {
         return Ok(None);
     };
+    let expired = rec
+        .expires_at
+        .map(|e| now_unix() >= e)
+        .unwrap_or(false);
     let needs_refresh = rec
         .expires_at
         .map(|e| now_unix() + 120 >= e)
-        .unwrap_or(false);
+        .unwrap_or(true); // unknown expiry → try refresh if we have a refresh token
     if needs_refresh {
         if let Some(rt) = rec.refresh_token.clone() {
             match refresh_token(paths, &rt, &rec.client_id).await {
@@ -152,26 +176,26 @@ pub async fn get_valid_xai_access_token(paths: &Paths) -> Result<Option<String>,
                 }
                 Err(e) => {
                     warn!(error = %e, "xAI OAuth refresh failed");
-                    // Fall through: try existing access token once
-                    if rec
-                        .expires_at
-                        .map(|e| now_unix() >= e)
-                        .unwrap_or(false)
-                    {
+                    if expired {
                         return Err(format!(
-                            "Grok OAuth expired and refresh failed: {e}. Run: oscar auth login"
+                            "SuperGrok OAuth expired and refresh failed: {e}. \
+                             Sign in again (Google/SuperGrok): oscar auth login  or  oscar auth login --device \
+                             — do not use API key for subscription models"
                         ));
                     }
+                    // Not fully expired yet: try existing access once.
                 }
             }
-        } else if rec.expires_at.map(|e| now_unix() >= e).unwrap_or(false) {
+        } else if expired {
             return Err(
-                "Grok OAuth expired (no refresh token). Run: oscar auth login".into(),
+                "SuperGrok OAuth expired (no refresh token). Run: oscar auth login --device".into(),
             );
         }
     }
     if rec.access_token.is_empty() {
-        return Ok(None);
+        return Err(
+            "SuperGrok OAuth entry has empty access token. Run: oscar auth login".into(),
+        );
     }
     Ok(Some(rec.access_token))
 }
@@ -205,14 +229,8 @@ async fn refresh_token(
 }
 
 fn store_session(paths: &Paths, session: OAuthSession) -> Result<(), String> {
-    // Mirror access token into keychain so resolve_llm_api_key + identities work.
-    let _ = store_provider_api_key(xai_canonical_id(), &session.access_token);
-    let _ = store_provider_api_key("grok", &session.access_token);
-
-    let mut file = load_auth_file(paths);
-    file.providers
-        .insert(xai_canonical_id().into(), session);
-    save_auth_file(paths, &file)
+    // AuthStore dual-writes to keychain under oscar/provider/xai (+ grok alias).
+    auth_store::set(paths, xai_canonical_id(), entry_from_session(&session))
 }
 
 fn parse_token_response(
@@ -382,7 +400,8 @@ pub async fn run_device_login(paths: &Paths) -> Result<OAuthSession, String> {
         .get("verification_uri_complete")
         .and_then(|x| x.as_str())
         .or_else(|| v.get("verification_uri").and_then(|x| x.as_str()))
-        .unwrap_or("https://accounts.x.ai/sign-in")
+        // xAI device portal (not the generic sign-in page).
+        .unwrap_or("https://accounts.x.ai/oauth2/device")
         .to_string();
     let interval = v
         .get("interval")
@@ -457,9 +476,12 @@ fn print_login_ok(session: &OAuthSession) {
         .clone()
         .or_else(|| session.user_id.clone())
         .unwrap_or_else(|| "signed in".into());
-    println!("✓ Grok / xAI OAuth ready — {who}");
+    let mode = session.auth_mode.as_deref().unwrap_or("oauth");
+    println!("✓ Grok SuperGrok OAuth ready — {who} (mode={mode})");
     println!("  Tokens: ~/.config/oscar/auth.json (0600) + OS keychain oscar/provider/xai");
-    println!("  Default: oscar provider set grok   (or leave xai)");
+    println!("  Auth type: oauth (subscription) — preferred over API key for Grok/xAI");
+    println!("  Default: oscar provider set grok");
+    println!("  Models:  oscar ask --provider grok --model grok-build-0.1 \"…\"");
     println!("  Logout:  oscar auth logout");
 }
 
@@ -685,7 +707,7 @@ pub fn status_line(paths: &Paths) -> String {
 
 /// True if we have a non-empty OAuth or keychain credential for Grok/xAI.
 pub fn xai_ready(paths: &Paths) -> bool {
-    if oauth_status(paths).is_some() {
+    if crate::auth_store::has_credentials(paths, xai_canonical_id()) {
         return true;
     }
     matches!(

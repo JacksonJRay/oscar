@@ -1,6 +1,7 @@
 //! Azure tools: DNS + network inventory + Network Watcher + pattern discovery.
 
 mod iam;
+mod network_write;
 mod resolver;
 mod sync_dns;
 mod sync_network;
@@ -35,8 +36,21 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register(Arc::new(AzureNetworkNextHop));
     registry.register(Arc::new(AzureNetworkPatternSearch));
     registry.register(Arc::new(AzureNetworkSubnetPattern));
+    registry.register(Arc::new(AzureNetworkVnetPattern));
+    registry.register(Arc::new(AzureNetworkNsgPattern));
+    registry.register(Arc::new(AzureNetworkRouteTablePattern));
+    registry.register(Arc::new(AzureNetworkRoutePattern));
+    registry.register(Arc::new(AzureComputeFunctionPattern));
+    registry.register(Arc::new(AzureNetworkPeeringPattern));
+    registry.register(Arc::new(AzureNetworkVpnPattern));
+    registry.register(Arc::new(AzureNetworkHybridPattern));
+    registry.register(Arc::new(AzureNetworkEndpointPattern));
+    registry.register(Arc::new(AzureNetworkNatPattern));
+    registry.register(Arc::new(AzureNetworkServicePattern));
     registry.register(Arc::new(AzureNetworkIpLocate));
     registry.register(Arc::new(AzureNetworkInventorySync));
+    // Network write (create/delete) — Capability::Write, mode-gated
+    network_write::register_network_write(registry);
     // Track C — Private DNS VNet links + Private Resolver
     registry.register(Arc::new(resolver::AzureDnsResolverInventorySync));
     registry.register(Arc::new(resolver::AzureDnsVnetLinkPatternSearch));
@@ -58,6 +72,17 @@ struct AzureNetworkPathTroubleshoot;
 struct AzureNetworkNextHop;
 struct AzureNetworkPatternSearch;
 struct AzureNetworkSubnetPattern;
+struct AzureNetworkVnetPattern;
+struct AzureNetworkNsgPattern;
+struct AzureNetworkRouteTablePattern;
+struct AzureNetworkRoutePattern;
+struct AzureComputeFunctionPattern;
+struct AzureNetworkPeeringPattern;
+struct AzureNetworkVpnPattern;
+struct AzureNetworkHybridPattern;
+struct AzureNetworkEndpointPattern;
+struct AzureNetworkNatPattern;
+struct AzureNetworkServicePattern;
 struct AzureNetworkIpLocate;
 
 #[async_trait]
@@ -116,16 +141,22 @@ impl Tool for AzureDnsRecordLookup {
         static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
         META.get_or_init(|| ToolMeta {
             id: "azure.dns.record.lookup".into(),
-            name: "Lookup Azure DNS record".into(),
-            description: "Record lookup; use azure.dns.pattern.search for partial discovery.".into(),
+            name: "Lookup Azure DNS record (partial)".into(),
+            description: "Find Azure DNS records by name fragment (partial match by default). Delegates to azure.dns.pattern.search.".into(),
             domain: ToolDomain::Dns,
             clouds: vec![Cloud::Azure],
             capability: Capability::Read,
-            tags: vec!["dns".into(), "record".into(), "lookup".into()],
+            tags: vec![
+                "dns".into(),
+                "record".into(),
+                "lookup".into(),
+                "partial".into(),
+                "search".into(),
+            ],
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string" },
+                    "name": { "type": "string", "description": "Record name or partial fragment" },
                     "type": { "type": "string" },
                     "profile_id": { "type": "string" }
                 },
@@ -143,6 +174,7 @@ impl Tool for AzureDnsRecordLookup {
         let mut a = args.clone();
         if let Some(obj) = a.as_object_mut() {
             obj.insert("pattern".into(), json!(name));
+            obj.insert("mode".into(), json!("partial"));
         }
         AzureDnsPatternSearch.execute(a, ctx).await
     }
@@ -650,6 +682,12 @@ impl Tool for AzureNetworkPathTroubleshoot {
                 "network-watcher".into(),
                 "agentless".into(),
                 "connection-troubleshoot".into(),
+                "connectivity".into(),
+                "connectivity-test".into(),
+                "status".into(),
+                "analyze".into(),
+                "troubleshoot".into(),
+                "reachability".into(),
             ],
             input_schema: json!({
                 "type": "object",
@@ -751,7 +789,16 @@ impl Tool for AzureNetworkNextHop {
             domain: ToolDomain::Network,
             clouds: vec![Cloud::Azure],
             capability: Capability::Read,
-            tags: vec!["network".into(), "next-hop".into(), "routing".into()],
+            tags: vec![
+                "network".into(),
+                "next-hop".into(),
+                "routing".into(),
+                "route".into(),
+                "status".into(),
+                "analyze".into(),
+                "troubleshoot".into(),
+                "connectivity".into(),
+            ],
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -822,7 +869,11 @@ impl Tool for AzureNetworkNextHop {
     }
 }
 
-async fn azure_net_pattern(args: serde_json::Value, ctx: &ToolContext, only_subnet: bool) -> ToolResult {
+async fn azure_net_pattern(
+    args: serde_json::Value,
+    ctx: &ToolContext,
+    kinds_filter: Option<&[&str]>,
+) -> ToolResult {
     let q = match PatternQuery::from_args(&args) {
         Ok(q) => q,
         Err(e) => return ToolResult::error(e),
@@ -856,8 +907,11 @@ async fn azure_net_pattern(args: serde_json::Value, ctx: &ToolContext, only_subn
         {
             Ok(inv) => {
                 let mut part = scan_network_inventory(&inv, &q);
-                if only_subnet {
-                    part.hits.retain(|h| h.kind.to_string() == "subnet");
+                if let Some(filters) = kinds_filter {
+                    part.hits.retain(|h| {
+                        let k = h.kind.to_string();
+                        filters.iter().any(|f| k == *f)
+                    });
                 }
                 merged.hits.append(&mut part.hits);
             }
@@ -866,8 +920,11 @@ async fn azure_net_pattern(args: serde_json::Value, ctx: &ToolContext, only_subn
                 merged.notes.push(format!("profile `{}`: {e}", p.id));
                 if let Some(inv) = load_network_cache(&ctx.config_dir, &p.id, q.region.as_deref()) {
                     let mut part = scan_network_inventory(&inv, &q);
-                    if only_subnet {
-                        part.hits.retain(|h| h.kind.to_string() == "subnet");
+                    if let Some(filters) = kinds_filter {
+                        part.hits.retain(|h| {
+                            let k = h.kind.to_string();
+                            filters.iter().any(|f| k == *f)
+                        });
                     }
                     merged.hits.append(&mut part.hits);
                 }
@@ -884,8 +941,8 @@ impl Tool for AzureNetworkInventorySync {
         static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
         META.get_or_init(|| ToolMeta {
             id: "azure.network.inventory.sync".into(),
-            name: "Sync VNet/subnet/IP into unified NetworkInventory".into(),
-            description: "Live-fetch Azure VNets, subnets, public IPs, and NIC private IPs via az; map to unified NetworkInventory for pattern search.".into(),
+            name: "Sync VNet/NSG/routes/Functions into NetworkInventory".into(),
+            description: "Live-fetch Azure VNets, subnets, public IPs, NICs, NSGs, route tables, and Function Apps via az; map to unified NetworkInventory for pattern search.".into(),
             domain: ToolDomain::Network,
             clouds: vec![Cloud::Azure],
             capability: Capability::Read,
@@ -895,6 +952,9 @@ impl Tool for AzureNetworkInventorySync {
                 "inventory".into(),
                 "vnet".into(),
                 "subnet".into(),
+                "nsg".into(),
+                "route-table".into(),
+                "function".into(),
                 "cache".into(),
             ],
             input_schema: json!({
@@ -923,6 +983,10 @@ impl Tool for AzureNetworkInventorySync {
         let mut vpcs = 0usize;
         let mut subnets = 0usize;
         let mut addrs = 0usize;
+        let mut sgs = 0usize;
+        let mut rts = 0usize;
+        let mut routes = 0usize;
+        let mut funcs = 0usize;
         for p in profiles {
             let r = region.or(p.default_region.as_deref());
             match source.sync_network(p, r).await {
@@ -930,26 +994,40 @@ impl Tool for AzureNetworkInventorySync {
                     vpcs += inv.vpcs.len();
                     subnets += inv.subnets.len();
                     addrs += inv.addresses.len();
+                    sgs += inv.security_groups.len();
+                    rts += inv.route_tables.len();
+                    routes += inv.routes.len();
+                    funcs += inv.functions.len();
                     let _ = write_network_cache(&ctx.config_dir, &inv);
                     details.push(format!(
-                        "{}: vnets={} subnets={} addresses={}",
+                        "{}: vnets={} subnets={} addresses={} nsgs={} route_tables={} routes={} functions={}",
                         p.id,
                         inv.vpcs.len(),
                         inv.subnets.len(),
-                        inv.addresses.len()
+                        inv.addresses.len(),
+                        inv.security_groups.len(),
+                        inv.route_tables.len(),
+                        inv.routes.len(),
+                        inv.functions.len()
                     ));
                 }
                 Err(e) => details.push(format!("{}: ERROR {e}", p.id)),
             }
         }
         ToolResult::success(
-            format!("Azure network sync: {vpcs} vnets, {subnets} subnets, {addrs} addresses"),
+            format!(
+                "Azure network sync: {vpcs} vnets, {subnets} subnets, {addrs} addresses, {sgs} nsgs, {rts} route tables, {routes} routes, {funcs} functions"
+            ),
             json!({
                 "cloud": "azure",
                 "format": "NetworkInventory",
                 "vpcs": vpcs,
                 "subnets": subnets,
                 "addresses": addrs,
+                "security_groups": sgs,
+                "route_tables": rts,
+                "routes": routes,
+                "functions": funcs,
                 "details": details
             }),
         )
@@ -962,8 +1040,10 @@ impl Tool for AzureNetworkPatternSearch {
         static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
         META.get_or_init(|| ToolMeta {
             id: "azure.network.pattern.search".into(),
-            name: "Pattern search VNets, subnets, IPs".into(),
-            description: discovery_blurb("Azure VNets, subnets, and addresses"),
+            name: "Pattern search VNets, subnets, NSGs, routes, Functions".into(),
+            description: discovery_blurb(
+                "Azure VNets, subnets, addresses, NSGs, route tables/routes, and Function Apps",
+            ),
             domain: ToolDomain::Network,
             clouds: vec![Cloud::Azure],
             capability: Capability::Read,
@@ -975,6 +1055,9 @@ impl Tool for AzureNetworkPatternSearch {
                 "vnet".into(),
                 "ip".into(),
                 "cidr".into(),
+                "nsg".into(),
+                "route".into(),
+                "function".into(),
                 "partial".into(),
             ],
             input_schema: json!({
@@ -987,7 +1070,7 @@ impl Tool for AzureNetworkPatternSearch {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        azure_net_pattern(args, ctx, false).await
+        azure_net_pattern(args, ctx, None).await
     }
 }
 
@@ -1013,7 +1096,304 @@ impl Tool for AzureNetworkSubnetPattern {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        azure_net_pattern(args, ctx, true).await
+        azure_net_pattern(args, ctx, Some(&["subnet"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for AzureNetworkVnetPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "azure.network.vnet.pattern".into(),
+            name: "Pattern search Azure VNets".into(),
+            description: discovery_blurb("Azure virtual networks (VNets) by name, id, or address space CIDR"),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Azure],
+            capability: Capability::Read,
+            tags: vec!["vnet".into(), "vpc".into(), "pattern".into(), "search".into(), "network".into(), "partial".into()],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        azure_net_pattern(args, ctx, Some(&["vpc"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for AzureNetworkNsgPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "azure.network.nsg.pattern".into(),
+            name: "Pattern search Azure NSGs".into(),
+            description: discovery_blurb(
+                "Azure network security groups (NSGs) by name or resource id",
+            ),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Azure],
+            capability: Capability::Read,
+            tags: vec![
+                "nsg".into(),
+                "security-group".into(),
+                "pattern".into(),
+                "search".into(),
+                "network".into(),
+                "partial".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        azure_net_pattern(args, ctx, Some(&["security_group"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for AzureNetworkRouteTablePattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "azure.network.route_table.pattern".into(),
+            name: "Pattern search Azure route tables".into(),
+            description: discovery_blurb(
+                "Azure route tables by name, id, destination prefix, or next hop",
+            ),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Azure],
+            capability: Capability::Read,
+            tags: vec!["route-table".into(), "udr".into(), "pattern".into(), "search".into(), "network".into(), "partial".into()],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        azure_net_pattern(args, ctx, Some(&["route_table"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for AzureNetworkRoutePattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "azure.network.route.pattern".into(),
+            name: "Pattern search Azure routes".into(),
+            description: discovery_blurb(
+                "Azure UDR routes by name, address prefix, or next-hop type/IP",
+            ),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Azure],
+            capability: Capability::Read,
+            tags: vec!["route".into(), "udr".into(), "pattern".into(), "search".into(), "cidr".into(), "network".into(), "partial".into()],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        azure_net_pattern(args, ctx, Some(&["route"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for AzureComputeFunctionPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "azure.compute.function.pattern".into(),
+            name: "Pattern search Azure Function Apps".into(),
+            description: discovery_blurb(
+                "Azure Function Apps by name, hostname, kind/runtime, or VNet subnet id",
+            ),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Azure],
+            capability: Capability::Read,
+            tags: vec![
+                "function".into(),
+                "functionapp".into(),
+                "compute".into(),
+                "pattern".into(),
+                "search".into(),
+                "serverless".into(),
+                "partial".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        azure_net_pattern(args, ctx, Some(&["function"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for AzureNetworkPeeringPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "azure.network.peering.pattern".into(),
+            name: "Pattern search VNet peerings".into(),
+            description: discovery_blurb("Azure VNet peerings by name, remote VNet, or peering state"),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Azure],
+            capability: Capability::Read,
+            tags: vec!["peering".into(), "vnet".into(), "pattern".into(), "search".into(), "network".into(), "partial".into()],
+            input_schema: json!({"type":"object","properties":pattern_properties(),"required":["pattern"]}),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        azure_net_pattern(args, ctx, Some(&["peering"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for AzureNetworkVpnPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "azure.network.vpn.pattern".into(),
+            name: "Pattern search VPN / VNet gateways".into(),
+            description: discovery_blurb("Azure virtual network gateways (VPN/ExpressRoute gateway) by name or type"),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Azure],
+            capability: Capability::Read,
+            tags: vec!["vpn".into(), "vnet-gateway".into(), "pattern".into(), "search".into(), "hybrid".into(), "network".into()],
+            input_schema: json!({"type":"object","properties":pattern_properties(),"required":["pattern"]}),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        azure_net_pattern(args, ctx, Some(&["vpn"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for AzureNetworkHybridPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "azure.network.hybrid.pattern".into(),
+            name: "Pattern search ExpressRoute circuits".into(),
+            description: discovery_blurb("Azure ExpressRoute circuits (hybrid on-prem connectivity)"),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Azure],
+            capability: Capability::Read,
+            tags: vec!["expressroute".into(), "hybrid".into(), "interconnect".into(), "pattern".into(), "search".into(), "network".into()],
+            input_schema: json!({"type":"object","properties":pattern_properties(),"required":["pattern"]}),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        azure_net_pattern(args, ctx, Some(&["hybrid_connection"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for AzureNetworkEndpointPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "azure.network.endpoint.pattern".into(),
+            name: "Pattern search Private Endpoints".into(),
+            description: discovery_blurb("Azure Private Endpoints (Private Link) by name, subnet, or service"),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Azure],
+            capability: Capability::Read,
+            tags: vec!["private-endpoint".into(), "privatelink".into(), "pattern".into(), "search".into(), "network".into(), "private".into()],
+            input_schema: json!({"type":"object","properties":pattern_properties(),"required":["pattern"]}),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        azure_net_pattern(args, ctx, Some(&["private_endpoint"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for AzureNetworkNatPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "azure.network.nat.pattern".into(),
+            name: "Pattern search NAT gateways".into(),
+            description: discovery_blurb("Azure NAT gateways by name or location"),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Azure],
+            capability: Capability::Read,
+            tags: vec!["nat".into(), "nat-gateway".into(), "pattern".into(), "search".into(), "network".into(), "egress".into()],
+            input_schema: json!({"type":"object","properties":pattern_properties(),"required":["pattern"]}),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        azure_net_pattern(args, ctx, Some(&["nat_gateway"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for AzureNetworkServicePattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "azure.network.service.pattern".into(),
+            name: "Pattern search all Azure network fabric services".into(),
+            description: discovery_blurb(
+                "Azure VNet peering, VPN gateways, ExpressRoute, Private Endpoints, NAT — broad fabric search",
+            ),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Azure],
+            capability: Capability::Read,
+            tags: vec![
+                "network".into(), "service".into(), "pattern".into(), "search".into(), "peering".into(),
+                "vpn".into(), "expressroute".into(), "private-endpoint".into(), "nat".into(), "partial".into(),
+            ],
+            input_schema: json!({"type":"object","properties":pattern_properties(),"required":["pattern"]}),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        azure_net_pattern(
+            args,
+            ctx,
+            Some(&[
+                "peering",
+                "vpn",
+                "hybrid_connection",
+                "private_endpoint",
+                "nat_gateway",
+                "transit_gateway",
+                "network_share",
+            ]),
+        )
+        .await
     }
 }
 
@@ -1053,6 +1433,6 @@ impl Tool for AzureNetworkIpLocate {
             }
             obj.insert("mode".into(), json!("ip_or_cidr"));
         }
-        azure_net_pattern(args, ctx, false).await
+        azure_net_pattern(args, ctx, None).await
     }
 }

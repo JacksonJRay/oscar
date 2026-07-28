@@ -57,6 +57,9 @@ oscar tools catalog                    # Code Mode docs the agent receives
 oscar provider list | status | set grok
 oscar auth login                       # Grok OAuth (browser) — primary
 oscar auth login --device              # Grok OAuth for SSH / headless
+oscar auth connect                     # list providers (models.dev + builtins)
+oscar auth connect openrouter --key-file ~/.key   # AuthStore + keychain mirror
+oscar auth list | remove --provider …
 oscar auth policy
 oscar auth provider-key --provider grok --key-file ~/.oscar-xai.key
 oscar auth aws-sso-login [--aws-profile NAME]    # browser SSO; keys never enter chat
@@ -67,9 +70,9 @@ oscar auth aws-test --profile aws-default
 oscar binaries
 ```
 
-In chat: **`/model`** lists models across all **loaded** providers; `/model 3` or `/model openai/gpt-4o` switches without unloading others. Details: [docs/AUTH-GROK.md](docs/AUTH-GROK.md).
+In chat: **`/connect`** lists providers; **`/model`** lists models across all **loaded** providers; `/model 3` or `/model openai/gpt-4o` switches without unloading others. Details: [docs/AUTH-GROK.md](docs/AUTH-GROK.md), [docs/PROVIDER-PLAN.md](docs/PROVIDER-PLAN.md).
 
-**Isolation guarantee:** raw credentials never enter the model transcript. Secure TUI paste and `oscar auth` write to the OS keychain or CSP CLI SSO only; tool results are deep-redacted (`***REDACTED***`). Built-in LLM providers **do not** read `XAI_API_KEY` / `OPENAI_API_KEY` unless `provider.api_key_env` is set for a **custom** provider.
+**Isolation guarantee:** raw credentials never enter the model transcript. LLM keys go to `~/.config/oscar/auth.json` (0600) and optional OS keychain mirror; CSP keys stay in keychain / binary SSO. Tool results are deep-redacted (`***REDACTED***`). Built-in LLM providers **do not** read `XAI_API_KEY` / `OPENAI_API_KEY` unless `provider.api_key_env` or `auth.allow_catalog_env` is set.
 
 ## TUI
 

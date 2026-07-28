@@ -83,8 +83,32 @@ pub enum ResourceKind {
     Subnet,
     IpAddress,
     SecurityGroup,
+    /// Network ACL (AWS NACL; CSP equivalents map here when distinct from SG/firewall).
+    Nacl,
     RouteTable,
+    /// Individual route entry (destination + target) within a route table or global routing table.
+    Route,
+    /// Serverless function (AWS Lambda, GCP Cloud Functions, Azure Functions).
+    Function,
     LoadBalancer,
+    /// VPC/VNet peering connection.
+    Peering,
+    /// Transit Gateway / hub (AWS TGW, Azure Virtual Hub / VWAN, GCP NCC hub).
+    TransitGateway,
+    /// Site-to-site or client VPN connection / gateway.
+    Vpn,
+    /// Hybrid interconnect (AWS Direct Connect, Azure ExpressRoute, GCP Interconnect).
+    HybridConnection,
+    /// Private connectivity endpoint (AWS VPC endpoint/PrivateLink, Azure Private Endpoint, GCP PSC).
+    PrivateEndpoint,
+    /// NAT gateway / Cloud NAT / Azure NAT gateway.
+    NatGateway,
+    /// Internet gateway / egress-only IGW.
+    InternetGateway,
+    /// Shared networking (AWS RAM, GCP Shared VPC, Azure shared VNet / subscription share).
+    NetworkShare,
+    /// Managed prefix list / IP group.
+    PrefixList,
     K8sNamespace,
     K8sPod,
     K8sService,
@@ -122,8 +146,20 @@ impl fmt::Display for ResourceKind {
             ResourceKind::Subnet => "subnet",
             ResourceKind::IpAddress => "ip_address",
             ResourceKind::SecurityGroup => "security_group",
+            ResourceKind::Nacl => "nacl",
             ResourceKind::RouteTable => "route_table",
+            ResourceKind::Route => "route",
+            ResourceKind::Function => "function",
             ResourceKind::LoadBalancer => "load_balancer",
+            ResourceKind::Peering => "peering",
+            ResourceKind::TransitGateway => "transit_gateway",
+            ResourceKind::Vpn => "vpn",
+            ResourceKind::HybridConnection => "hybrid_connection",
+            ResourceKind::PrivateEndpoint => "private_endpoint",
+            ResourceKind::NatGateway => "nat_gateway",
+            ResourceKind::InternetGateway => "internet_gateway",
+            ResourceKind::NetworkShare => "network_share",
+            ResourceKind::PrefixList => "prefix_list",
             ResourceKind::K8sNamespace => "k8s_namespace",
             ResourceKind::K8sPod => "k8s_pod",
             ResourceKind::K8sService => "k8s_service",

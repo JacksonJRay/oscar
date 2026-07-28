@@ -6,13 +6,15 @@ use oscar_core::events::AgentEvent;
 use oscar_core::{ExecutionMode, ThinkingConfig};
 use oscar_identity::{
     assume_role_into_profile, critical_csp_binaries, plan_install,
-    run_install_commands, store_aws_long_lived, store_aws_short_lived, store_provider_api_key,
+    run_install_commands, store_aws_long_lived, store_aws_short_lived,
     validate_aws, BinaryInventory, KeychainStore, Profile, ProfileStore,
 };
 use oscar_providers::{
-    create_provider, create_provider_async, format_model_list, inject_headless_llm_key,
-    list_loaded_providers, list_provider_ids, provider_has_credentials, resolve_model_selection,
-    run_browser_login, run_device_login, xai_oauth_status_line, clear_xai_oauth,
+    auth_remove, connect_api_key, create_provider_from_config_sync,
+    create_provider_from_oscar_config, format_model_list, inject_headless_llm_key_with_paths,
+    list_auth_status, list_connectable_providers_cfg, list_loaded_providers, list_provider_ids,
+    provider_has_credentials, resolve_model_selection, run_browser_login, run_device_login,
+    xai_oauth_status_line, clear_xai_oauth,
 };
 use oscar_tools::sync::{DnsInventorySource, NetworkInventorySource};
 use oscar_aws::DnsResolverInventorySource;
@@ -22,11 +24,56 @@ use oscar_tools::{
     load_dns_cache, load_network_cache, write_dns_cache, write_network_cache, DnsSyncOpts,
     ToolRegistry,
 };
-use oscar_tui::{run_tui, App, AppConfig, ToolCatalogEntry};
+use oscar_tui::{run_tui, App, AppConfig, ToolCatalogEntry, TuiExit};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+
+mod sse_hub;
+use sse_hub::{
+    spawn_sse_watchdog, SseHostHooks, SseHub, SseHubConfig, DEFAULT_SSE_BIND,
+};
+
+/// Install tracing. For TUI mode, write to `~/.config/oscar/logs/oscar.log` so
+/// SSE debug / warns never paint over the Ratatui alternate screen.
+fn init_tracing(paths: &Paths, tui_mode: bool) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("warn,oscar=warn,oscar_mcp=warn,oscar_agent=warn,oscar_providers=warn")
+    });
+
+    if tui_mode {
+        let log_path = paths.logs_dir.join("oscar.log");
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(file) => {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .with_target(false)
+                    .with_ansi(false)
+                    .try_init();
+            }
+            Err(_) => {
+                // Fall back to stderr only if log file cannot be opened (pre-TUI).
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::io::stderr)
+                    .with_target(false)
+                    .try_init();
+            }
+        }
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_target(false)
+            .try_init();
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -136,7 +183,7 @@ enum Commands {
     Compact,
     /// List / show / delete / resume saved chat sessions (history)
     #[command(long_about = "Grok Build–style chat history under ~/.config/oscar/sessions/.\n\n\
-In TUI: history auto-saves after each turn · /history · /new · /resume <id>\n\n\
+Each TUI launch starts a **new** chat. Previous chats: /resume (picker) or /resume <id>.\n\n\
 CLI:\n  oscar sessions list\n  oscar sessions show <id>\n  oscar sessions delete <id>\n  oscar sessions resume <id>   # open TUI on that chat")]
     Sessions {
         #[command(subcommand)]
@@ -172,10 +219,11 @@ Agent never runs sudo without explicit `approve install` (or oscar binaries inst
         action: Option<SettingsCmd>,
     },
     /// List and inspect skills (prompt playbooks that steer outside the harness)
-    #[command(long_about = "Skills are SKILL.md packages (like Grok Build skills) that steer the agent for specialized tasks without rewriting the core harness.\n\n\
+    #[command(long_about = "Skills are SKILL.md playbooks (Grok Build / OpenCode style) that steer the agent without bloating context.\n\n\
 Locations (priority): ./.oscar/skills/  →  ~/.config/oscar/skills/  →  builtin\n\n\
-In chat: /skills  |  /skill least-privilege-iam\n\
-Agent tools: system.skills.list  |  system.skills.get")]
+Progressive disclosure: catalog is name+description only; full body loads via system.skills.get or tools_execute skill.<name>.\n\n\
+In chat: /skills  |  /skill <name>  |  ask agent to create a playbook\n\
+Agent: system.skills.search | get | create  |  tools_search also returns skill.*")]
     Skills {
         #[command(subcommand)]
         action: Option<SkillsCmd>,
@@ -205,6 +253,23 @@ Examples:\n  oscar access whoami --cloud aws\n  oscar access users list --cloud 
     Access {
         #[command(subcommand)]
         action: AccessCmd,
+    },
+    /// Local headless HTTP + SSE event bus (OpenCode-style) for testing chat→agent
+    #[command(long_about = "Run a local agent HTTP server with Server-Sent Events.\n\n\
+Endpoints (default bind 127.0.0.1:4096):\n\
+  GET  /health          — liveness\n\
+  GET  /event           — SSE stream of AgentEvent JSON (heartbeat every 10s)\n\
+  POST /prompt          — body text or {\"text\":\"…\"}; runs one agent turn\n\
+  POST /cancel          — cancel in-flight turn\n\n\
+Examples:\n\
+  oscar serve\n\
+  oscar serve --bind 127.0.0.1:4096\n\
+  curl -N http://127.0.0.1:4096/event &\n\
+  curl -sS -X POST http://127.0.0.1:4096/prompt -d 'why is dns broken?'\n")]
+    Serve {
+        /// Bind address (host:port)
+        #[arg(long, default_value = "127.0.0.1:4096", env = "OSCAR_SERVE_BIND")]
+        bind: String,
     },
 }
 
@@ -622,10 +687,36 @@ Requires SuperGrok / eligible subscription for OAuth API access; otherwise use p
     /// Show Grok OAuth + loaded provider credential status
     #[command(name = "status")]
     AuthStatus,
-    /// Store LLM provider API key in OS keychain (preferred; not env)
-    #[command(long_about = "Writes provider API key to OS keychain under oscar/provider/<id>. Prefer --key-file. Key is never printed. Built-in providers will not fall back to XAI_API_KEY/OPENAI_API_KEY unless config sets provider.api_key_env (custom providers).")]
+    /// Connect an LLM provider (OpenCode-style /connect) — list or store API key
+    #[command(long_about = "OpenCode-aligned connect flow.\n\n\
+List providers (models.dev + builtins):\n  oscar auth connect\n  oscar auth connect --search openrouter\n\n\
+Store API key in AuthStore (~/.config/oscar/auth.json 0600) + keychain mirror:\n  oscar auth connect openrouter --key-file ~/.openrouter.key\n\n\
+Grok OAuth: oscar auth login  (or connect xai after OAuth).")]
+    Connect {
+        /// Provider id (omit to list/search)
+        provider: Option<String>,
+        #[arg(long, short = 's')]
+        search: Option<String>,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long)]
+        key_file: Option<String>,
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
+    },
+    /// List connected LLM providers (no secrets)
+    #[command(name = "list")]
+    AuthList,
+    /// Remove LLM credentials for a provider from AuthStore (+ keychain mirror)
+    #[command(name = "remove")]
+    AuthRemove {
+        #[arg(long)]
+        provider: String,
+    },
+    /// Store LLM provider API key in AuthStore + OS keychain (preferred; not env)
+    #[command(long_about = "Writes provider API key to ~/.config/oscar/auth.json (0600) and mirrors to OS keychain under oscar/provider/<id>. Prefer --key-file. Key is never printed. Built-in providers will not fall back to XAI_API_KEY/OPENAI_API_KEY unless config sets provider.api_key_env or auth.allow_catalog_env.")]
     ProviderKey {
-        #[arg(long, long_help = "Provider id: grok | xai | openai | anthropic | opencode-zen | opencode-go | custom")]
+        #[arg(long, long_help = "Provider id: grok | xai | openai | anthropic | openrouter | opencode-zen | custom")]
         provider: String,
         #[arg(long, long_help = "API key string (avoid if possible—prefer --key-file)")]
         key: Option<String>,
@@ -821,23 +912,38 @@ enum ProviderCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("oscar=info".parse()?))
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
     let paths = Paths::discover()?;
     paths.ensure()?;
+
+    // Interactive TUI owns the alternate screen — never let tracing/SSE hit stderr.
+    let tui_mode = cli.command.is_none()
+        || matches!(
+            &cli.command,
+            Some(Commands::Sessions {
+                action: Some(SessionsCmd::Resume { .. })
+            })
+        );
+    init_tracing(&paths, tui_mode);
+
     let mut cfg = OscarConfig::load(&paths)?;
 
     if let Some(m) = &cli.mode {
         cfg.mode = ExecutionMode::parse(m).context("invalid --mode")?;
     }
+    // Switching provider must also swap base_url/model from the providers.* slot
+    // (or catalog default). Setting only `provider.id` left the previous
+    // provider's base_url in place (e.g. NVIDIA URL used for xAI → 404).
     if let Some(p) = &cli.provider {
-        cfg.provider.id = p.clone();
-    }
-    if let Some(m) = &cli.model {
+        let model = cli.model.clone();
+        cfg.activate_provider(p, model.clone());
+        if cfg.provider.base_url.is_none() {
+            cfg.provider.base_url = oscar_providers::default_base_url(p);
+        }
+        if cfg.provider.model.is_none() {
+            cfg.provider.model = Some(oscar_providers::default_model_for(p));
+        }
+    } else if let Some(m) = &cli.model {
         cfg.provider.model = Some(m.clone());
     }
     if let Some(t) = &cli.thinking {
@@ -850,7 +956,8 @@ async fn main() -> Result<()> {
     }
     // Headless global LLM key → keychain (never rely on default XAI_API_KEY env)
     if let Some(key) = &cli.llm_api_key {
-        inject_headless_llm_key(&cfg.provider.id, key).map_err(|e| anyhow::anyhow!(e))?;
+        inject_headless_llm_key_with_paths(&cfg.provider.id, key, Some(&paths))
+            .map_err(|e| anyhow::anyhow!(e))?;
     }
 
     match cli.command {
@@ -862,7 +969,7 @@ async fn main() -> Result<()> {
             llm_api_key,
         }) => {
             if let Some(key) = llm_api_key {
-                inject_headless_llm_key(&cfg.provider.id, &key)
+                inject_headless_llm_key_with_paths(&cfg.provider.id, &key, Some(&paths))
                     .map_err(|e| anyhow::anyhow!(e))?;
             }
             run_ask(cfg, paths, prompt, stream, output).await
@@ -872,6 +979,7 @@ async fn main() -> Result<()> {
         Some(Commands::Skills { action }) => run_skills(action, &cfg),
         Some(Commands::Identities { action }) => run_identities(action, &paths),
         Some(Commands::Mcp { action }) => run_mcp(action, &mut cfg, &paths).await,
+        Some(Commands::Serve { bind }) => run_serve(cfg, paths, bind).await,
         Some(Commands::Access { action }) => run_access(action, &cfg, &paths).await,
         Some(Commands::Auth { action }) => run_auth(action, &paths).await,
         Some(Commands::Mode { action }) => {
@@ -1427,12 +1535,14 @@ async fn run_auth(action: AuthCmd, paths: &Paths) -> Result<()> {
         AuthCmd::Policy => {
             println!(
                 r#"oscar auth policy:
-- Grok (primary): `oscar auth login` (OAuth browser) or `oscar auth login --device` (SSH).
-  Fallback API key: `oscar auth provider-key --provider grok --key-file …`
-- Other LLMs: OS keychain via `oscar auth provider-key` or headless `--llm-api-key`.
-  Default env vars (XAI_API_KEY, …) are NOT used unless config sets provider.api_key_env.
-- Multi-provider: auth several providers; switch with `/model` without losing others.
+- LLM AuthStore: ~/.config/oscar/auth.json (0600), typed api|oauth (OpenCode-aligned).
+- Grok (primary): `oscar auth login` (OAuth) or `oscar auth login --device` (SSH).
+- Any provider: `oscar auth connect <id> --key-file …`  or  `/connect` in TUI.
+- Also: `oscar auth provider-key`, headless `--llm-api-key`.
+- Default env vars (XAI_API_KEY, …) are NOT used unless provider.api_key_env or auth.allow_catalog_env.
+- Multi-provider: connect several; switch with `/model` without losing others.
 - CSP: keychain long-lived keys, short-lived STS/session tokens, OR binary sessions (aws/gcloud/az).
+- Catalog: models.dev (cached) for provider list — OSCAR_DISABLE_MODELS_FETCH=1 to skip network.
 - Detected binaries: `oscar binaries`
 "#
             );
@@ -1457,19 +1567,14 @@ async fn run_auth(action: AuthCmd, paths: &Paths) -> Result<()> {
                         cfg.activate_provider("grok", Some("grok-4".into()));
                     } else {
                         cfg.sync_active_provider_slot();
-                        // Always ensure grok slot exists when OAuth succeeds
+                        // Single Grok slot (xai is only an auth alias, not a second provider)
                         cfg.providers.entry("grok".into()).or_insert_with(|| {
                             oscar_core::config::ProviderSlot {
                                 model: Some("grok-4".into()),
                                 ..Default::default()
                             }
                         });
-                        cfg.providers.entry("xai".into()).or_insert_with(|| {
-                            oscar_core::config::ProviderSlot {
-                                model: Some("grok-4".into()),
-                                ..Default::default()
-                            }
-                        });
+                        cfg.providers.remove("xai");
                     }
                     let _ = cfg.save(paths);
                     let _ = session;
@@ -1487,6 +1592,16 @@ async fn run_auth(action: AuthCmd, paths: &Paths) -> Result<()> {
             println!("{}", xai_oauth_status_line(paths));
             let cfg = OscarConfig::load(paths).unwrap_or_default();
             println!("active provider={} model={}", cfg.provider.id, cfg.provider.model.as_deref().unwrap_or("—"));
+            println!("# auth store (no secrets)");
+            for s in list_auth_status(paths) {
+                println!(
+                    "  {}  type={}  secret={}  email={}",
+                    s.provider_id,
+                    s.kind,
+                    if s.has_secret { "yes" } else { "no" },
+                    s.email.as_deref().unwrap_or("—")
+                );
+            }
             println!("# loaded providers");
             for p in list_loaded_providers(&cfg, paths) {
                 println!(
@@ -1499,6 +1614,97 @@ async fn run_auth(action: AuthCmd, paths: &Paths) -> Result<()> {
             }
             Ok(())
         }
+        AuthCmd::Connect {
+            provider,
+            search,
+            key,
+            key_file,
+            limit,
+        } => {
+            let q = search.as_deref().unwrap_or("");
+            if provider.is_none() && key.is_none() && key_file.is_none() {
+                println!("# oscar auth connect — providers (models.dev + builtins)");
+                println!("# usage: oscar auth connect <id> --key-file ~/.key");
+                println!("#        oscar auth connect --search openrouter");
+                println!("# Grok OAuth: oscar auth login");
+                println!();
+                let cfg = OscarConfig::load(paths).unwrap_or_default();
+                for (id, name, api) in list_connectable_providers_cfg(q, limit, &cfg.catalog) {
+                    let ready = if provider_has_credentials(paths, &id) {
+                        "ready"
+                    } else {
+                        "—"
+                    };
+                    println!("  {id:<20} {ready:<6}  {name}  {api}");
+                }
+                return Ok(());
+            }
+            let provider = provider.ok_or_else(|| {
+                anyhow::anyhow!("specify provider id, e.g. oscar auth connect openrouter --key-file …")
+            })?;
+            if provider == "xai" || provider == "grok" {
+                if key.is_none() && key_file.is_none() {
+                    println!("Grok/xAI: prefer OAuth → oscar auth login");
+                    println!("Or paste API key: oscar auth connect xai --key-file …");
+                    return Ok(());
+                }
+            }
+            let key = if let Some(f) = key_file {
+                std::fs::read_to_string(f)?.trim().to_string()
+            } else {
+                key.ok_or_else(|| anyhow::anyhow!("provide --key or --key-file"))?
+            };
+            let mut cfg = OscarConfig::load(paths).unwrap_or_default();
+            connect_api_key(&cfg, paths, &provider, &key).map_err(|e| anyhow::anyhow!(e))?;
+            let model = oscar_providers::default_model_for(&provider);
+            // Apply catalog default base_url into slot when unset
+            let base = oscar_providers::default_base_url(&provider);
+            cfg.providers
+                .entry(provider.clone())
+                .or_insert_with(|| oscar_core::config::ProviderSlot {
+                    model: Some(model.clone()),
+                    base_url: base.clone(),
+                    ..Default::default()
+                });
+            if !provider_has_credentials(paths, &cfg.provider.id) {
+                cfg.activate_provider(&provider, Some(model));
+                if cfg.provider.base_url.is_none() {
+                    cfg.provider.base_url = base;
+                }
+            }
+            let _ = cfg.save(paths);
+            println!(
+                "connected `{provider}` (AuthStore{}). Switch: /model list  or  oscar provider set {provider}",
+                if cfg.auth.mirror_keychain {
+                    " + keychain mirror"
+                } else {
+                    ""
+                }
+            );
+            Ok(())
+        }
+        AuthCmd::AuthList => {
+            println!("# connected LLM providers (secrets never printed)");
+            let rows = list_auth_status(paths);
+            if rows.is_empty() {
+                println!("(none — oscar auth connect <provider> --key-file …)");
+            } else {
+                for s in rows {
+                    println!(
+                        "  {:<16}  type={:<8}  ready={}",
+                        s.provider_id,
+                        s.kind,
+                        s.has_secret
+                    );
+                }
+            }
+            Ok(())
+        }
+        AuthCmd::AuthRemove { provider } => {
+            auth_remove(paths, &provider).map_err(|e| anyhow::anyhow!(e))?;
+            println!("removed LLM credentials for `{provider}` from AuthStore (+ keychain mirror)");
+            Ok(())
+        }
         AuthCmd::ProviderKey {
             provider,
             key,
@@ -1509,21 +1715,18 @@ async fn run_auth(action: AuthCmd, paths: &Paths) -> Result<()> {
             } else {
                 key.ok_or_else(|| anyhow::anyhow!("provide --key or --key-file"))?
             };
-            store_provider_api_key(&provider, &key)?;
-            // Keep multi-provider slot so /model can switch back
             let mut cfg = OscarConfig::load(paths).unwrap_or_default();
+            connect_api_key(&cfg, paths, &provider, &key).map_err(|e| anyhow::anyhow!(e))?;
+            // Keep multi-provider slot so /model can switch back
             cfg.providers
                 .entry(provider.clone())
                 .or_insert_with(|| oscar_core::config::ProviderSlot {
                     model: cfg.provider.model.clone(),
+                    base_url: oscar_providers::default_base_url(&provider),
                     ..Default::default()
                 });
-            if provider == "grok" || provider == "xai" {
-                let _ = store_provider_api_key("xai", &key);
-                let _ = store_provider_api_key("grok", &key);
-            }
             let _ = cfg.save(paths);
-            println!("stored LLM API key for provider `{provider}` in OS keychain (slot loaded)");
+            println!("stored LLM API key for provider `{provider}` in AuthStore (slot loaded)");
             Ok(())
         }
         AuthCmd::AwsKeys {
@@ -1558,6 +1761,30 @@ async fn run_auth(action: AuthCmd, paths: &Paths) -> Result<()> {
                 &session_token,
                 None,
             )?;
+            // Best-effort: pin account_ref from STS so multi-account isolation works.
+            let binaries = BinaryInventory::detect();
+            if let Ok(id_json) = validate_aws(&p, &binaries) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&id_json) {
+                    if let Some(acct) = v.get("Account").and_then(|a| a.as_str()) {
+                        if let Ok(mut store) = ProfileStore::load(paths) {
+                            if let Some(existing) = store.get(&profile).cloned() {
+                                let mut updated = existing;
+                                if !oscar_identity::profile_has_fixed_account(&updated)
+                                    || updated.account_ref == "pending"
+                                {
+                                    updated.account_ref = acct.to_string();
+                                    store.upsert(updated);
+                                    let _ = store.save();
+                                    println!(
+                                        "stored short-lived AWS session for profile `{profile}` (account {acct})"
+                                    );
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             println!("stored short-lived AWS session for profile `{profile}` in keychain");
             Ok(())
         }
@@ -2205,7 +2432,7 @@ fn json_obj(pairs: impl IntoIterator<Item = (&'static str, Option<serde_json::Va
 async fn build_agent(cfg: &OscarConfig, paths: &Paths) -> Result<Agent> {
     let profiles = Arc::new(ProfileStore::load(paths)?);
     let tools = Arc::new(build_registry_with_mcp(cfg).await);
-    let provider = create_provider_async(&cfg.provider, paths)
+    let provider = create_provider_from_oscar_config(cfg, paths)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
     let model = cfg
@@ -3127,6 +3354,107 @@ fn toggle_cloud_menu(cfg: &mut OscarConfig, paths: &Paths, cloud: &str) -> Resul
     Ok(())
 }
 
+/// Headless-only: SSE hub + agent worker (same hub/watchdog as TUI embed).
+async fn run_serve(cfg: OscarConfig, paths: Paths, bind: String) -> Result<()> {
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let agent = build_agent(&cfg, &paths).await.map_err(|e| {
+        anyhow::anyhow!(
+            "cannot start serve without LLM provider: {e}\n\
+             fix: oscar auth connect xai --key-file …  or  oscar auth login"
+        )
+    })?;
+
+    let mut sse_cfg = SseHubConfig::from_env_and(&cfg.sse);
+    sse_cfg.enabled = true;
+    sse_cfg.bind = if bind.is_empty() {
+        DEFAULT_SSE_BIND.to_string()
+    } else {
+        bind
+    };
+    let hub = SseHub::new(512);
+    let (user_tx, mut user_rx) = mpsc::unbounded_channel::<String>();
+    let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(8);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
+    let shutdown = CancellationToken::new();
+
+    // Mirror agent events onto SSE.
+    let hub_fan = hub.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = event_rx.recv().await {
+            hub_fan.publish(&ev);
+        }
+    });
+
+    let _watch = spawn_sse_watchdog(
+        hub.clone(),
+        sse_cfg,
+        SseHostHooks {
+            user_tx: Some(user_tx),
+            cancel_tx: Some(cancel_tx),
+            event_tx: Some(event_tx.clone()),
+        },
+        shutdown.clone(),
+    );
+
+    eprintln!(
+        "oscar serve (headless)  provider={} model={}",
+        cfg.provider.id,
+        cfg.provider.model.as_deref().unwrap_or("?")
+    );
+    eprintln!("  watchdog on · GET /event · POST /prompt · POST /cancel");
+    eprintln!("  (Ctrl+C to stop)");
+
+    let agent = Arc::new(Mutex::new(Some(agent)));
+    let mut cancel = CancellationToken::new();
+    let mut cfg = cfg;
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                shutdown.cancel();
+                break;
+            }
+            Some(()) = cancel_rx.recv() => {
+                cancel.cancel();
+                cancel = CancellationToken::new();
+            }
+            Some(user) = user_rx.recv() => {
+                // Slash commands share the TUI host path (model list, etc.)
+                if user.starts_with('/') {
+                    let mut guard = agent.lock().await;
+                    handle_slash(&user, &mut *guard, &mut cfg, &paths, &event_tx).await;
+                    continue;
+                }
+                cancel = CancellationToken::new();
+                let token = cancel.clone();
+                let mut guard = agent.lock().await;
+                let Some(a) = guard.as_mut() else {
+                    let _ = event_tx
+                        .send(AgentEvent::Error {
+                            message: "no agent".into(),
+                        })
+                        .await;
+                    continue;
+                };
+                let turn = a.run_turn(user, event_tx.clone(), token);
+                tokio::pin!(turn);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some(()) = cancel_rx.recv() => {
+                            cancel.cancel();
+                        }
+                        _ = &mut turn => break,
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_ask(
     cfg: OscarConfig,
     paths: Paths,
@@ -3237,10 +3565,17 @@ async fn run_chat_with_session(
     resume_id: Option<String>,
 ) -> Result<()> {
     let profiles = ProfileStore::load(&paths)?;
-    let profile_count = profiles.list().len();
+    let profile_list = profiles.list();
+    let profile_count = profile_list.len();
+    // Prefer a profile labeled default / *-default, else first entry (status bar).
+    let active_profile = profile_list
+        .iter()
+        .find(|p| p.label.eq_ignore_ascii_case("default") || p.id.ends_with("-default"))
+        .or_else(|| profile_list.first())
+        .map(|p| p.id.clone());
 
     // Build provider early to resolve model name for status bar; agent rebuilt per turn host.
-    let provider_result = create_provider(&cfg.provider);
+    let provider_result = create_provider_from_config_sync(&cfg, &paths);
     let (provider_id, model) = match &provider_result {
         Ok(p) => {
             let model = cfg
@@ -3282,22 +3617,21 @@ async fn run_chat_with_session(
         mode: cfg.mode,
         show_thinking: cfg.ui.show_thinking || cfg.thinking.is_on(),
         profile_count,
+        active_profile,
         oscar_config: cfg.clone(),
         tool_catalog,
         profiles_path: paths.profiles_file.clone(),
         provider_ready: provider_result.is_ok(),
     });
 
-    // Load or create persistent chat session (Grok Build–style history)
+    // Grok Build–style: every TUI launch starts a **new** session.
+    // Resume previous chats via `/resume` (picker) or `oscar sessions resume <id>`.
     let mut stored = if let Some(id) = resume_id {
         oscar_core::load_session(&paths, &id).unwrap_or_else(|_| {
             oscar_core::StoredChatSession::new(&provider_id, &model, cfg.mode.to_string())
         })
     } else {
-        oscar_core::load_current_or_latest(&paths)?
-            .unwrap_or_else(|| {
-                oscar_core::StoredChatSession::new(&provider_id, &model, cfg.mode.to_string())
-            })
+        oscar_core::StoredChatSession::new(&provider_id, &model, cfg.mode.to_string())
     };
     // Ensure transcript has at least bootstrap line
     if stored.transcript.is_empty() {
@@ -3306,13 +3640,53 @@ async fn run_chat_with_session(
     app.load_transcript(&stored.transcript, &stored.id, &stored.title);
     let created_at = stored.created_at;
 
-    let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(256);
-    let (user_tx, mut user_rx) = mpsc::channel::<String>(32);
+    // Event path: host → TUI (+ SSE hub publish on a parallel subscriber task).
+    // Larger buffer so model-list dumps never block the host.
+    let (event_tx, mut event_rx_for_sse) = mpsc::channel::<AgentEvent>(1024);
+    let (tui_event_tx, tui_event_rx) = mpsc::channel::<AgentEvent>(1024);
+    // Unbounded: a blocked/busy host must never prevent the TUI from queueing
+    // the next slash/chat line (bounded try_send was dropping/hanging submits).
+    // Unbounded user channel: TUI must never block/drop submits when host is busy.
+    let (user_tx, mut user_rx) = mpsc::unbounded_channel::<String>();
+    let user_tx_tui = user_tx.clone();
+    let user_tx_sse = user_tx.clone();
     let (secret_tx, mut secret_rx) = mpsc::channel(8);
     let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(8);
+    let cancel_tx_sse = cancel_tx.clone();
     let (config_tx, mut config_rx) = mpsc::channel::<OscarConfig>(8);
     let (session_tx, session_rx) = mpsc::channel::<oscar_core::StoredChatSession>(4);
     let (transcript_tx, mut transcript_rx) = mpsc::channel::<Vec<oscar_core::TranscriptLine>>(8);
+
+    let sse_hub = SseHub::new(512);
+    // quiet=true: no stderr while TUI owns the alternate screen (was corrupting chat UI).
+    let sse_cfg = SseHubConfig::for_tui(&cfg.sse);
+    let sse_shutdown = CancellationToken::new();
+    let _sse_watch = spawn_sse_watchdog(
+        sse_hub.clone(),
+        sse_cfg.clone(),
+        SseHostHooks {
+            user_tx: Some(user_tx_sse),
+            cancel_tx: Some(cancel_tx_sse),
+            event_tx: Some(event_tx.clone()),
+        },
+        sse_shutdown.clone(),
+    );
+
+    // Dual-publish: every host event → TUI + SSE (no fragile middleman task).
+    let hub_mirror = sse_hub.clone();
+    let tui_mirror = tui_event_tx;
+    tokio::spawn(async move {
+        while let Some(ev) = event_rx_for_sse.recv().await {
+            hub_mirror.publish(&ev);
+            // Never drop TUI events: await if buffer is full.
+            if tui_mirror.send(ev).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // SSE hub runs quietly in the background — never inject bind notices into chat
+    // (was painting "[sse] http://127.0.0.1:4096/…" as blue/cyan system chrome).
 
     let mut agent = match provider_result {
         Ok(_) => {
@@ -3331,8 +3705,8 @@ async fn run_chat_with_session(
     let tui_handle = tokio::spawn(async move {
         run_tui(
             app,
-            event_rx,
-            user_tx,
+            tui_event_rx,
+            user_tx_tui,
             secret_tx,
             cancel_tx,
             config_tx,
@@ -3350,12 +3724,14 @@ async fn run_chat_with_session(
         let mut stored = stored;
         let created_at = created_at;
         loop {
-            // Pull latest TUI transcript for saves
+            // Pull latest TUI transcript for saves (non-blocking so we never
+            // starve the user/slash channel on a flood of transcript snapshots).
             while let Ok(tr) = transcript_rx.try_recv() {
                 stored.transcript = tr;
             }
+            // No `biased`: every arm fairly competes. A sticky transcript/config
+            // arm must not starve user/slash input forever.
             tokio::select! {
-                biased;
                 Some(()) = cancel_rx.recv() => {
                     cancel.cancel();
                     cancel = CancellationToken::new();
@@ -3407,9 +3783,27 @@ async fn run_chat_with_session(
                                 agent = Some(a);
                             }
                             Err(e) => {
-                                let _ = event_tx_host
-                                    .send(AgentEvent::Error { message: e.to_string() })
-                                    .await;
+                                // Soft-fail: user often switches provider then pastes a key.
+                                // Hard Error would bounce TUI back to the Provider menu mid-paste.
+                                let msg = e.to_string();
+                                let soft = msg.to_ascii_lowercase().contains("no credentials")
+                                    || msg.to_ascii_lowercase().contains("no api key")
+                                    || msg.to_ascii_lowercase().contains("no grok")
+                                    || msg.to_ascii_lowercase().contains("no llm");
+                                if soft {
+                                    let _ = event_tx_host
+                                        .send(AgentEvent::ContentDelta {
+                                            text: format!(
+                                                "\n[provider] awaiting credentials for `{}` — paste an API key (secure bar).\n",
+                                                cfg.provider.id
+                                            ),
+                                        })
+                                        .await;
+                                } else {
+                                    let _ = event_tx_host
+                                        .send(AgentEvent::Error { message: msg })
+                                        .await;
+                                }
                             }
                         }
                     } else if let Some(a) = agent.as_mut() {
@@ -3420,7 +3814,7 @@ async fn run_chat_with_session(
                         a.session.context.config.threshold = cfg.context.threshold;
                         a.session.context.config.keep_latest_thinking =
                             cfg.context.keep_latest_thinking;
-                    } else if create_provider(&cfg.provider).is_ok() {
+                    } else if create_provider_from_config_sync(&cfg, &paths).is_ok() {
                         match build_agent(&cfg, &paths).await {
                             Ok(mut a) => {
                                 a.load_chat_history(&stored);
@@ -3450,20 +3844,45 @@ async fn run_chat_with_session(
                         .send(AgentEvent::Done { usage: None })
                         .await;
                 }
-                Some((auth, kind, secret)) = secret_rx.recv() => {
-                    // Store secret into keychain only — never log value or send it to the agent/model.
+                Some((auth, mut batch)) = secret_rx.recv() => {
+                    // Store secret(s) to oscar secrets dir only — never log values or send to the model.
+                    // Bulk AWS export arrives as one batch (all kinds) so we store then resume once.
                     use oscar_core::SecretKind;
-                    let secret_len = secret.len();
 
                     // LLM provider key paste: profile_hint = "provider:<id>"
-                    if kind == SecretKind::ApiKey {
+                    if batch.len() == 1 && batch[0].0 == SecretKind::ApiKey {
+                        let (_kind, secret) = batch.remove(0);
+                        let secret_len = secret.len();
                         if let Some(hint) = auth.profile_hint.as_deref() {
                             if let Some(pid) = hint.strip_prefix("provider:") {
-                                match store_provider_api_key(pid, &secret) {
+                                match connect_api_key(&cfg, &paths, pid, &secret) {
                                     Ok(()) => {
                                         drop(secret);
-                                        cfg.provider.id = pid.to_string();
-                                        let _ = cfg.save(&paths);
+                                        // Activate this provider as default with catalog defaults.
+                                        let model = oscar_providers::default_model_for(pid);
+                                        let base = oscar_providers::default_base_url(pid);
+                                        cfg.activate_provider(pid, Some(model.clone()));
+                                        if cfg.provider.base_url.is_none() {
+                                            cfg.provider.base_url = base.clone();
+                                        }
+                                        cfg.providers.insert(
+                                            pid.to_string(),
+                                            oscar_core::config::ProviderSlot {
+                                                model: Some(model.clone()),
+                                                base_url: cfg.provider.base_url.clone().or(base),
+                                                ..Default::default()
+                                            },
+                                        );
+                                        cfg.sync_active_provider_slot();
+                                        if let Err(e) = cfg.save(&paths) {
+                                            let _ = event_tx_host
+                                                .send(AgentEvent::Error {
+                                                    message: format!(
+                                                        "key stored but config save failed: {e}"
+                                                    ),
+                                                })
+                                                .await;
+                                        }
                                         let _ = event_tx_host
                                             .send(AgentEvent::ContentDelta {
                                                 text: format!(
@@ -3484,14 +3903,20 @@ async fn run_chat_with_session(
                                                         ),
                                                     })
                                                     .await;
+                                                let _ = event_tx_host
+                                                    .send(AgentEvent::Done { usage: None })
+                                                    .await;
                                             }
                                             Err(e) => {
                                                 let _ = event_tx_host
-                                                    .send(AgentEvent::Error {
-                                                        message: format!(
-                                                            "Provider key stored but agent still not ready: {e}"
+                                                    .send(AgentEvent::ContentDelta {
+                                                        text: format!(
+                                                            "\n[provider ready: {pid} — key stored; agent rebuild deferred: {e}]\n"
                                                         ),
                                                     })
+                                                    .await;
+                                                let _ = event_tx_host
+                                                    .send(AgentEvent::Done { usage: None })
                                                     .await;
                                             }
                                         }
@@ -3502,6 +3927,9 @@ async fn run_chat_with_session(
                                             .send(AgentEvent::Error {
                                                 message: format!("failed to store provider key: {e}"),
                                             })
+                                            .await;
+                                        let _ = event_tx_host
+                                            .send(AgentEvent::Done { usage: None })
                                             .await;
                                     }
                                 }
@@ -3528,28 +3956,116 @@ async fn run_chat_with_session(
                         let _ = store.save();
                     }
                     let mut all_kinds_ready = false;
-                    if let Some(p) = store.get(&profile_id) {
-                        if let Err(e) = KeychainStore::set(&p.secret_keyring_id, kind, &secret) {
-                            let _ = event_tx_host.send(AgentEvent::Error { message: e.to_string() }).await;
+                    let mut stored_kinds: Vec<String> = Vec::new();
+                    let mut rejected = false;
+                    if let Some(p) = store.get(&profile_id).cloned() {
+                        for (kind, secret) in batch {
+                            let secret = secret.trim().to_string();
+                            let secret_len = secret.len();
+                            if matches!(
+                                kind,
+                                SecretKind::AccessKeyId
+                                    | SecretKind::SecretAccessKey
+                                    | SecretKind::SessionToken
+                            ) {
+                                if let Err(e) =
+                                    oscar_identity::validate_aws_secret_value(kind, &secret)
+                                {
+                                    let _ = event_tx_host
+                                        .send(AgentEvent::Error {
+                                            message: format!(
+                                                "Rejected {kind:?} for `{profile_id}`: {e}. Paste only the export AWS_* lines into the secure bar (not chat)."
+                                            ),
+                                        })
+                                        .await;
+                                    rejected = true;
+                                    continue;
+                                }
+                            }
+                            if let Err(e) = KeychainStore::set(&p.secret_keyring_id, kind, &secret)
+                            {
+                                let _ = event_tx_host
+                                    .send(AgentEvent::Error { message: e.to_string() })
+                                    .await;
+                                rejected = true;
+                            } else {
+                                stored_kinds.push(format!("{kind:?}({secret_len}B)"));
+                            }
+                        }
+
+                        // Prefer structured short-lived store when all three are present.
+                        if auth.cloud == oscar_core::Cloud::Aws {
+                            let ak = KeychainStore::get(
+                                &p.secret_keyring_id,
+                                SecretKind::AccessKeyId,
+                            )
+                            .ok()
+                            .flatten();
+                            let sk = KeychainStore::get(
+                                &p.secret_keyring_id,
+                                SecretKind::SecretAccessKey,
+                            )
+                            .ok()
+                            .flatten();
+                            let tok = KeychainStore::get(
+                                &p.secret_keyring_id,
+                                SecretKind::SessionToken,
+                            )
+                            .ok()
+                            .flatten();
+                            if let (Some(ref a), Some(ref s), Some(ref t)) = (&ak, &sk, &tok) {
+                                if oscar_identity::validate_aws_secret_value(
+                                    SecretKind::AccessKeyId,
+                                    a,
+                                )
+                                .is_ok()
+                                    && oscar_identity::validate_aws_secret_value(
+                                        SecretKind::SecretAccessKey,
+                                        s,
+                                    )
+                                    .is_ok()
+                                    && oscar_identity::validate_aws_secret_value(
+                                        SecretKind::SessionToken,
+                                        t,
+                                    )
+                                    .is_ok()
+                                {
+                                    let _ = store_aws_short_lived(&p, a, s, t, None);
+                                }
+                            }
+                            all_kinds_ready =
+                                oscar_identity::profile_has_stored_aws_keys(&p)
+                                    && (!auth.kinds.contains(&SecretKind::SessionToken)
+                                        || KeychainStore::has(
+                                            &p.secret_keyring_id,
+                                            SecretKind::SessionToken,
+                                        ));
                         } else {
-                            // Field-by-field secure paste (e.g. access_key_id → secret → session_token).
-                            all_kinds_ready = auth.kinds.iter().all(|k| {
-                                KeychainStore::has(&p.secret_keyring_id, *k)
-                            });
+                            all_kinds_ready = auth
+                                .kinds
+                                .iter()
+                                .all(|k| KeychainStore::has(&p.secret_keyring_id, *k));
+                        }
+
+                        if !stored_kinds.is_empty() {
                             let msg = if all_kinds_ready {
                                 format!(
-                                    "\n[secure bar] stored {kind:?} for profile `{profile_id}` ({secret_len} bytes) — value NOT visible to agent. All requested fields present; auto-retrying paused tool.\n"
+                                    "\n[secure bar] stored {} for profile `{profile_id}` — values NOT visible to agent. Credentials ready; auto-retrying paused tool.\n",
+                                    stored_kinds.join(", ")
                                 )
                             } else {
                                 format!(
-                                    "\n[secure bar] stored {kind:?} for profile `{profile_id}` ({secret_len} bytes) — value NOT visible to agent. Enter next field in the secure bar (still not shown to the agent).\n"
+                                    "\n[secure bar] stored {} for profile `{profile_id}` — values NOT visible to agent. Enter remaining fields in the secure bar.\n",
+                                    stored_kinds.join(", ")
                                 )
                             };
                             let _ = event_tx_host
                                 .send(AgentEvent::ContentDelta { text: msg })
                                 .await;
                         }
-                        drop(secret);
+                        if rejected && !all_kinds_ready {
+                            continue;
+                        }
                     }
                     // Preserve pending retry + install + preferred profile across rebuild.
                     let pending = agent.as_ref().and_then(|a| a.pending_retry.clone());
@@ -3564,8 +4080,7 @@ async fn run_chat_with_session(
                             a.pending_install = pending_install;
                             a.preferred_profile_id = preferred;
                             a.refresh_system();
-                            // Only resume when all auth kinds for this request are in keychain
-                            // (short-lived keys are multi-field: access + secret + session token).
+                            // Resume only when credentials are complete (one shot after bulk).
                             if a.pending_retry.is_some() && all_kinds_ready {
                                 cancel = CancellationToken::new();
                                 a.resume_after_auth(event_tx_host.clone(), cancel.clone()).await;
@@ -3578,51 +4093,75 @@ async fn run_chat_with_session(
                     }
                 }
                 Some(user) = user_rx.recv() => {
+                    tracing::info!(%user, "tui host received user/slash");
                     // Session history slash commands
                     let ut = user.trim();
-                    if ut == "/new" {
-                        if let Some(a) = agent.as_mut() {
+                    if ut == "/new" || ut == "/clear" {
+                        let (prov, model, mode) = if let Some(a) = agent.as_mut() {
                             a.new_chat();
-                            stored = oscar_core::StoredChatSession::new(
-                                &a.provider_id,
-                                &a.model_id,
+                            (
+                                a.provider_id.clone(),
+                                a.model_id.clone(),
                                 a.session.mode.to_string(),
-                            );
+                            )
+                        } else {
+                            (
+                                cfg.provider.id.clone(),
+                                cfg.provider
+                                    .model
+                                    .clone()
+                                    .unwrap_or_else(|| "—".into()),
+                                cfg.mode.to_string(),
+                            )
+                        };
+                        stored = oscar_core::StoredChatSession::new(&prov, &model, mode);
+                        if let Some(a) = agent.as_mut() {
                             stored.id = a.session.id.clone();
-                            stored.created_at = chrono::Utc::now();
-                            stored.transcript = vec![oscar_core::TranscriptLine {
-                                kind: "system".into(),
-                                text: format!(
-                                    "New chat `{}` · auto-saves after each turn · /history",
-                                    &stored.id[..stored.id.len().min(8)]
-                                ),
-                            }];
-                            let _ = oscar_core::save_session(&paths, &stored);
-                            let _ = session_tx_host.send(stored.clone()).await;
-                            let _ = event_tx_host
-                                .send(AgentEvent::ContentDelta {
-                                    text: format!(
-                                        "\n[new chat {} — history cleared for this view]\n",
-                                        &stored.id[..8.min(stored.id.len())]
-                                    ),
-                                })
-                                .await;
-                            let _ = event_tx_host.send(AgentEvent::Done { usage: None }).await;
+                            a.session.title = stored.title.clone();
                         }
+                        stored.created_at = chrono::Utc::now();
+                        stored.transcript = vec![oscar_core::TranscriptLine {
+                            kind: "system".into(),
+                            text: format!(
+                                "New chat `{}` · auto-saves · /resume to browse history",
+                                &stored.id[..stored.id.len().min(8)]
+                            ),
+                        }];
+                        // Do not write empty session until first turn (keeps /resume list clean).
+                        let _ = session_tx_host.send(stored.clone()).await;
+                        let _ = event_tx_host
+                            .send(AgentEvent::ContentDelta {
+                                text: format!(
+                                    "\n[new chat {} — history cleared for this view]\n",
+                                    &stored.id[..8.min(stored.id.len())]
+                                ),
+                            })
+                            .await;
+                        let _ = event_tx_host.send(AgentEvent::Done { usage: None }).await;
                         continue;
                     }
-                    if ut == "/history" || ut == "/sessions" || ut.starts_with("/history ") {
+                    // Bare /resume | /history | /sessions: list for host-only clients;
+                    // TUI opens the interactive picker itself.
+                    if ut == "/history"
+                        || ut == "/sessions"
+                        || ut == "/resume"
+                        || ut == "/session"
+                        || ut.starts_with("/history ")
+                    {
                         match oscar_core::list_sessions(&paths) {
                             Ok(list) => {
                                 let mut lines = vec![
-                                    "# chat history (~/.config/oscar/sessions/)".into(),
-                                    format!("current: {}", stored.id),
+                                    "# previous sessions (~/.config/oscar/sessions/)".into(),
+                                    format!("this launch: {}", stored.id),
                                     String::new(),
                                 ];
                                 if list.is_empty() {
-                                    lines.push("(no sessions yet — chat will auto-save)".into());
+                                    lines.push(
+                                        "(no previous sessions yet — each launch is a new chat)"
+                                            .into(),
+                                    );
                                 }
-                                for s in list.iter().take(30) {
+                                for s in list.iter().take(40) {
                                     let cur = if s.id == stored.id { "*" } else { " " };
                                     lines.push(format!(
                                         "{cur} {}  {}  msgs={}  {}\n    {}",
@@ -3634,7 +4173,10 @@ async fn run_chat_with_session(
                                     ));
                                 }
                                 lines.push(String::new());
-                                lines.push("Resume: /resume <id>   New: /new   CLI: oscar sessions list".into());
+                                lines.push(
+                                    "Resume: /resume <id-or-title>   New: /new   CLI: oscar sessions list"
+                                        .into(),
+                                );
                                 let _ = event_tx_host
                                     .send(AgentEvent::ContentDelta {
                                         text: format!("{}\n", lines.join("\n")),
@@ -3652,9 +4194,12 @@ async fn run_chat_with_session(
                         let _ = event_tx_host.send(AgentEvent::Done { usage: None }).await;
                         continue;
                     }
-                    if let Some(id) = ut.strip_prefix("/resume ").or_else(|| ut.strip_prefix("/session ")) {
+                    if let Some(id) = ut
+                        .strip_prefix("/resume ")
+                        .or_else(|| ut.strip_prefix("/session "))
+                    {
                         let id = id.trim();
-                        // Allow short prefix match
+                        // Allow short prefix or title match (Grok Build style).
                         let resolved = resolve_session_id(&paths, id);
                         match resolved.and_then(|rid| oscar_core::load_session(&paths, &rid).ok()) {
                             Some(s) => {
@@ -3663,6 +4208,24 @@ async fn run_chat_with_session(
                                     a.load_chat_history(&stored);
                                     a.session.id = stored.id.clone();
                                     a.session.title = stored.title.clone();
+                                } else if create_provider_from_config_sync(&cfg, &paths).is_ok() {
+                                    match build_agent(&cfg, &paths).await {
+                                        Ok(mut a) => {
+                                            a.load_chat_history(&stored);
+                                            a.session.id = stored.id.clone();
+                                            a.session.title = stored.title.clone();
+                                            agent = Some(a);
+                                        }
+                                        Err(e) => {
+                                            let _ = event_tx_host
+                                                .send(AgentEvent::Error {
+                                                    message: format!(
+                                                        "session loaded but agent rebuild failed: {e}"
+                                                    ),
+                                                })
+                                                .await;
+                                        }
+                                    }
                                 }
                                 let _ = oscar_core::set_current_session_id(&paths, &stored.id);
                                 let _ = session_tx_host.send(stored.clone()).await;
@@ -3680,7 +4243,7 @@ async fn run_chat_with_session(
                                 let _ = event_tx_host
                                     .send(AgentEvent::Error {
                                         message: format!(
-                                            "session not found: {id} — /history to list"
+                                            "session not found: {id} — /resume to browse, or oscar sessions list"
                                         ),
                                     })
                                     .await;
@@ -3712,11 +4275,41 @@ async fn run_chat_with_session(
                         handle_slash(&user, &mut agent, &mut cfg, &paths, &event_tx_host).await;
                         continue;
                     }
+                    // Key paste often races the first chat turn: credentials are stored but
+                    // agent was still None. Always try a rebuild before bouncing to Provider.
+                    if agent.is_none() {
+                        match build_agent(&cfg, &paths).await {
+                            Ok(mut a) => {
+                                a.load_chat_history(&stored);
+                                a.session.id = stored.id.clone();
+                                a.session.title = stored.title.clone();
+                                agent = Some(a);
+                                let _ = event_tx_host
+                                    .send(AgentEvent::ContentDelta {
+                                        text: format!(
+                                            "\n[provider ready: {} — agent online]\n",
+                                            cfg.provider.id
+                                        ),
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = event_tx_host
+                                    .send(AgentEvent::Error {
+                                        message: format!(
+                                            "No LLM provider ready: {e}. Use /provider to paste an API key, or: oscar auth connect {}",
+                                            cfg.provider.id
+                                        ),
+                                    })
+                                    .await;
+                                let _ = event_tx_host
+                                    .send(AgentEvent::Done { usage: None })
+                                    .await;
+                                continue;
+                            }
+                        }
+                    }
                     let Some(agent) = agent.as_mut() else {
-                        let _ = event_tx_host.send(AgentEvent::Error {
-                            message: "No LLM provider configured. Opening Provider setup — select a provider and paste an API key (secure bar), or run: oscar auth provider-key --provider …".into(),
-                        }).await;
-                        let _ = event_tx_host.send(AgentEvent::Done { usage: None }).await;
                         continue;
                     };
                     cancel = CancellationToken::new();
@@ -3814,12 +4407,57 @@ async fn run_chat_with_session(
                 else => break,
             }
         }
+        // TUI closed: drain last transcript and persist so /resume works.
+        while let Ok(tr) = transcript_rx.try_recv() {
+            stored.transcript = tr;
+        }
+        if let Some(a) = agent.as_ref() {
+            persist_chat(&paths, &mut stored, a, created_at);
+        } else if !stored.messages.is_empty()
+            || stored
+                .transcript
+                .iter()
+                .any(|l| matches!(l.kind.as_str(), "user" | "assistant" | "tool" | "error"))
+        {
+            stored.touch();
+            if let Err(e) = oscar_core::save_session(&paths, &stored) {
+                tracing::warn!(error = %e, "failed to save chat session on exit");
+            }
+        } else {
+            // Always mark current so the resume command is consistent even for empty chats.
+            let _ = oscar_core::set_current_session_id(&paths, &stored.id);
+            // Persist empty shell so `oscar sessions resume <id>` finds it.
+            let _ = oscar_core::save_session(&paths, &stored);
+        }
+        stored
     });
 
-    tui_handle.await??;
-    // Final transcript may be on the channel from TUI exit
-    // (host may already be aborted — best-effort)
-    host.abort();
+    let tui_exit: TuiExit = tui_handle.await??;
+    // Resume hint is printed inside run_tui right after LeaveAlternateScreen.
+    // Stop SSE watchdog; let host finish final save (channels closed by TUI).
+    sse_shutdown.cancel();
+    let host_abort = host.abort_handle();
+    let final_stored = match tokio::time::timeout(std::time::Duration::from_millis(1500), host).await
+    {
+        Ok(Ok(stored)) => Some(stored),
+        Ok(Err(_)) | Err(_) => {
+            // Host may still be mid-turn; abort after short wait.
+            host_abort.abort();
+            None
+        }
+    };
+    // Fallback only if TUI had no session id (edge case).
+    if tui_exit.session_id.trim().is_empty() {
+        if let Some(s) = final_stored.as_ref() {
+            TuiExit {
+                session_id: s.id.clone(),
+                session_title: s.title.clone(),
+            }
+            .print_resume_hint();
+        } else {
+            tui_exit.print_resume_hint();
+        }
+    }
     Ok(())
 }
 
@@ -3886,23 +4524,41 @@ fn transcript_from_messages(messages: &[oscar_core::Message]) -> Vec<oscar_core:
     out
 }
 
-fn resolve_session_id(paths: &Paths, prefix: &str) -> Option<String> {
-    if prefix.is_empty() {
+/// Resolve session by full id, id prefix, or title (case-insensitive; Grok Build parity).
+fn resolve_session_id(paths: &Paths, query: &str) -> Option<String> {
+    let query = query.trim();
+    if query.is_empty() {
         return None;
     }
-    if oscar_core::load_session(paths, prefix).is_ok() {
-        return Some(prefix.to_string());
+    if oscar_core::load_session(paths, query).is_ok() {
+        return Some(query.to_string());
     }
     let list = oscar_core::list_sessions(paths).ok()?;
-    let matches: Vec<_> = list
-        .into_iter()
-        .filter(|s| s.id.starts_with(prefix))
+    // Unique id prefix
+    let id_matches: Vec<_> = list
+        .iter()
+        .filter(|s| s.id.starts_with(query))
         .collect();
-    if matches.len() == 1 {
-        Some(matches[0].id.clone())
-    } else {
-        None
+    if id_matches.len() == 1 {
+        return Some(id_matches[0].id.clone());
     }
+    // Title match (case-insensitive exact, then contains)
+    let q = query.to_ascii_lowercase();
+    let exact: Vec<_> = list
+        .iter()
+        .filter(|s| s.title.eq_ignore_ascii_case(query))
+        .collect();
+    if exact.len() == 1 {
+        return Some(exact[0].id.clone());
+    }
+    let contains: Vec<_> = list
+        .iter()
+        .filter(|s| s.title.to_ascii_lowercase().contains(&q))
+        .collect();
+    if contains.len() == 1 {
+        return Some(contains[0].id.clone());
+    }
+    None
 }
 
 async fn run_sessions(
@@ -4046,7 +4702,19 @@ async fn handle_model_slash(
         || rest == "show"
         || rest == "status"
     {
-        let text = format_model_list(cfg, paths);
+        // format_model_list may hit models.dev via *blocking* reqwest — never run
+        // that on the async runtime (freezes TUI + host). Use spawn_blocking.
+        let cfg_c = cfg.clone();
+        let paths_c = paths.clone();
+        let _ = tx
+            .send(AgentEvent::ContentDelta {
+                text: "\n[model] listing…\n".into(),
+            })
+            .await;
+        let text = tokio::task::spawn_blocking(move || format_model_list(&cfg_c, &paths_c))
+            .await
+            .unwrap_or_else(|e| format!("model list failed: {e}"));
+        tracing::info!(chars = text.len(), "model list ready");
         let _ = tx
             .send(AgentEvent::ContentDelta {
                 text: format!("\n{text}\n"),
@@ -4065,13 +4733,14 @@ async fn handle_model_slash(
 /model list
 /model 3              pick by number from the list
 /model grok-4         model id (prefers active provider, then any loaded)
+/model grok-4.5       Grok 4.5
 /model openai/gpt-4o  explicit provider/model
 /model openai gpt-4o  same
 
 Load more providers (they stay loaded while you switch):
-  oscar auth login                         # Grok OAuth (primary)
-  oscar auth provider-key --provider openai --key-file …
-  /provider                                # TUI setup
+  oscar auth login                              # Grok OAuth (primary)
+  oscar auth connect openrouter --key-file …    # any models.dev provider
+  /connect · /provider                          # TUI setup
 
 Active provider is saved; others remain in [providers.*] slots.
 "
@@ -4082,7 +4751,16 @@ Active provider is saved; others remain in [providers.*] slots.
         return;
     }
 
-    match resolve_model_selection(cfg, paths, rest) {
+    // resolve_model_selection also touches catalog — off the async worker.
+    let cfg_c = cfg.clone();
+    let paths_c = paths.clone();
+    let rest_owned = rest.to_string();
+    let resolved =
+        tokio::task::spawn_blocking(move || resolve_model_selection(&cfg_c, &paths_c, &rest_owned))
+            .await
+            .unwrap_or_else(|e| Err(format!("model resolve failed: {e}")));
+
+    match resolved {
         Ok((provider_id, model_id)) => {
             let prev = format!(
                 "{}/{}",
@@ -4090,6 +4768,10 @@ Active provider is saved; others remain in [providers.*] slots.
                 cfg.provider.model.as_deref().unwrap_or("—")
             );
             cfg.activate_provider(&provider_id, Some(model_id.clone()));
+            if cfg.provider.base_url.is_none() {
+                cfg.provider.base_url = oscar_providers::default_base_url(&provider_id);
+            }
+            cfg.sync_active_provider_slot();
             if let Err(e) = cfg.save(paths) {
                 let _ = tx
                     .send(AgentEvent::Error {
@@ -4124,11 +4806,11 @@ Active provider is saved; others remain in [providers.*] slots.
                     }
                     a.refresh_system();
                     *agent = Some(a);
+                    let disp = oscar_providers::display_provider_id(&cfg.provider.id);
                     let _ = tx
                         .send(AgentEvent::ContentDelta {
                             text: format!(
-                                "\n[model] {prev} → {}/{}  (loaded providers kept; /model list)\n",
-                                cfg.provider.id, model_id
+                                "\n[model] {prev} → {disp}/{model_id}  (loaded providers kept; /model list)\n"
                             ),
                         })
                         .await;
@@ -4581,7 +5263,9 @@ Mount: tools_search → tools_execute mcp.<server>.<tool>
                     ));
                 }
                 lines.push(String::new());
-                lines.push("Activate: /skill <name>".into());
+                lines.push("Activate (load full body into session context): /skill <name>".into());
+                lines.push("Agent progressive path: system.skills.search → system.skills.get | tools_execute skill.<name>".into());
+                lines.push("Create playbook: ask the agent (\"when I say X…\") — system.skills.create (works in readonly)".into());
                 lines.push("CLI: oscar skills list | show <name>".into());
                 let _ = tx
                     .send(AgentEvent::ContentDelta {
@@ -4615,6 +5299,44 @@ Mount: tools_search → tools_execute mcp.<server>.<tool>
             }
             let _ = tx.send(AgentEvent::Done { usage: None }).await;
         }
+        Some("/connect") => {
+            // OpenCode-style: list/search providers; key paste via /provider or CLI
+            let rest = user
+                .trim()
+                .strip_prefix("/connect")
+                .unwrap_or("")
+                .trim();
+            let (search, limit) = if rest.is_empty() {
+                ("", 30usize)
+            } else {
+                (rest, 40usize)
+            };
+            let mut lines = vec![
+                "# /connect — LLM providers (models.dev + builtins)".into(),
+                "CLI (stores key securely): oscar auth connect <id> --key-file ~/.key".into(),
+                "Grok OAuth: oscar auth login   ·   list: oscar auth list   ·   remove: oscar auth remove --provider <id>"
+                    .into(),
+                "TUI: /provider → paste key (secure bar) · /model after connect".into(),
+                String::new(),
+            ];
+            for (id, name, api) in list_connectable_providers_cfg(search, limit, &cfg.catalog) {
+                let ready = if provider_has_credentials(paths, &id) {
+                    "ready"
+                } else {
+                    "—"
+                };
+                lines.push(format!("  {id:<20} {ready:<6}  {name}  {api}"));
+            }
+            if !search.is_empty() {
+                lines.push(format!("\n(filter: `{search}`)"));
+            }
+            let _ = tx
+                .send(AgentEvent::ContentDelta {
+                    text: format!("\n{}\n", lines.join("\n")),
+                })
+                .await;
+            let _ = tx.send(AgentEvent::Done { usage: None }).await;
+        }
         Some("/model") | Some("/models") => {
             handle_model_slash(user, agent, cfg, paths, tx).await;
         }
@@ -4623,6 +5345,7 @@ Mount: tools_search → tools_execute mcp.<server>.<tool>
                 .send(AgentEvent::ContentDelta {
                     text: "\
 # slash commands
+/connect [search]    list providers to connect (OpenCode-style)
 /model [list|N|name|provider/model]   switch model across loaded providers
 /models                               same as /model list
 /settings [show|…]   Ctrl+,
@@ -4632,16 +5355,16 @@ Mount: tools_search → tools_execute mcp.<server>.<tool>
 /mcp list|enable|disable
 /thinking [on|off|toggle]
 /context  /compact  /mode
-/history  /sessions     # list saved chats
-/resume <id>            # load a saved chat
-/new                    # start fresh chat (auto-saves history)
+/resume                  # browse previous sessions (picker)
+/resume <id|title>      # load a saved chat
+/new  /clear            # start fresh chat (each launch is already new)
 /copy [N|path]          copy assistant reply
 /quit
 approve install | deny install
 
-Multi-provider: oscar auth login (Grok) + provider-key for others; /model switches without unloading.
+Multi-provider: oscar auth login (Grok) + oscar auth connect <id> for others; /model switches without unloading.
 Sessions auto-save to ~/.config/oscar/sessions/ after each turn.
-CLI: oscar sessions list|show|delete|resume|new · oscar auth login
+CLI: oscar sessions list|show|delete|resume|new · oscar auth login · oscar auth connect
 "
                     .into(),
                 })

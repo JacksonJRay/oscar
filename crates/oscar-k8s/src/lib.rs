@@ -3,10 +3,12 @@
 mod cni;
 mod sync;
 
-pub use sync::{k8s_inventory_to_network, sync_and_cache, KubectlK8sSource};
+pub use sync::{
+    k8s_inventory_to_network, sync_and_cache, sync_and_cache_with_opts, KubectlK8sSource,
+};
 
 use async_trait::async_trait;
-use oscar_core::{Capability, Cloud, PatternQuery, ToolDomain};
+use oscar_core::{Capability, Cloud, ClusterKind, ClusterRef, PatternQuery, ToolDomain};
 use oscar_tools::inventory::{k8s_cache_path, load_json, K8sInventory, K8sResourceEntry};
 use oscar_tools::{
     auth_for, discovery_blurb, discovery_tool_result, pattern_properties, scan_k8s_inventory,
@@ -15,11 +17,77 @@ use oscar_tools::{
 use serde_json::json;
 use std::sync::Arc;
 
+/// Env for kubectl exec plugins: AWS short-lived from linked cloud profile (EKS).
+fn cluster_kubectl_env(ctx: &ToolContext, c: &ClusterRef) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if !matches!(c.kind, ClusterKind::Eks) && c.linked_cloud_profile_id.is_none() {
+        return env;
+    }
+    let Some(lid) = c.linked_cloud_profile_id.as_deref() else {
+        return env;
+    };
+    let Some(cloud_p) = ctx.profiles.get(lid) else {
+        return env;
+    };
+    if cloud_p.cloud != Cloud::Aws {
+        return env;
+    }
+    if let Ok(creds) = oscar_identity::resolve_aws_process_creds(cloud_p, &ctx.binaries) {
+        for (k, v) in creds.env {
+            env.push((k, v));
+        }
+    }
+    env
+}
+
+/// Prefer full context from kubeconfig when short name is not in default config.
+fn resolve_context_name(c: &ClusterRef) -> Option<String> {
+    if let Some(ref path) = c.kubeconfig_path {
+        if std::path::Path::new(path).exists() {
+            // Use first context in managed kubeconfig if stored context missing from default
+            if let Ok(out) = std::process::Command::new("kubectl")
+                .env("KUBECONFIG", path)
+                .args(["config", "get-contexts", "-o", "name"])
+                .output()
+            {
+                if out.status.success() {
+                    let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if let Some(want) = c.context.as_deref() {
+                        if names.iter().any(|n| n == want) {
+                            return Some(want.to_string());
+                        }
+                        // fragment match
+                        if let Some(n) = names.iter().find(|n| n.contains(want) || want.contains(n.as_str())) {
+                            return Some(n.clone());
+                        }
+                    }
+                    if let Some(n) = names.iter().find(|n| n.contains(&c.name) || c.name.contains(n.as_str())) {
+                        return Some(n.clone());
+                    }
+                    return names.into_iter().next();
+                }
+            }
+        }
+    }
+    c.context.clone()
+}
+
 pub fn register(registry: &mut ToolRegistry) {
     registry.register(Arc::new(K8sContextsList));
+    // Broad → narrow pattern ladder
     registry.register(Arc::new(K8sResourcesPatternSearch));
     registry.register(Arc::new(K8sPodsPatternSearch));
     registry.register(Arc::new(K8sServicesPatternSearch));
+    registry.register(Arc::new(K8sNodesPatternSearch));
+    registry.register(Arc::new(K8sNamespacesPatternSearch));
+    registry.register(Arc::new(K8sDeploymentsPatternSearch));
+    registry.register(Arc::new(K8sIngressPatternSearch));
+    registry.register(Arc::new(K8sNetworkPolicyPatternSearch));
+    registry.register(Arc::new(K8sEndpointsPatternSearch));
     registry.register(Arc::new(K8sInventorySync));
     registry.register(Arc::new(K8sResourceCreate));
     registry.register(Arc::new(K8sResourceDelete));
@@ -31,6 +99,12 @@ struct K8sContextsList;
 struct K8sResourcesPatternSearch;
 struct K8sPodsPatternSearch;
 struct K8sServicesPatternSearch;
+struct K8sNodesPatternSearch;
+struct K8sNamespacesPatternSearch;
+struct K8sDeploymentsPatternSearch;
+struct K8sIngressPatternSearch;
+struct K8sNetworkPolicyPatternSearch;
+struct K8sEndpointsPatternSearch;
 struct K8sInventorySync;
 struct K8sResourceCreate;
 struct K8sResourceDelete;
@@ -40,7 +114,7 @@ async fn load_all_k8s(ctx: &ToolContext, force_sync: bool) -> (Vec<K8sInventory>
     let mut partial = false;
     let mut notes = Vec::new();
 
-    // Per-profile cluster caches
+    // Per-profile cluster caches (honor kubeconfig_path + linked AWS STS for EKS)
     for p in ctx.profiles.list() {
         for c in &p.clusters {
             let key = c.context.as_deref().unwrap_or(&c.name);
@@ -50,7 +124,18 @@ async fn load_all_k8s(ctx: &ToolContext, force_sync: bool) -> (Vec<K8sInventory>
                     continue;
                 }
             }
-            match sync_and_cache(&ctx.config_dir, c.context.as_deref(), Some(&p.id)).await {
+            let env = cluster_kubectl_env(ctx, c);
+            // Prefer kubeconfig file without --context if context name may be short/alias
+            let ctx_name = resolve_context_name(c);
+            match sync_and_cache_with_opts(
+                &ctx.config_dir,
+                ctx_name.as_deref(),
+                Some(&p.id),
+                c.kubeconfig_path.as_deref(),
+                env,
+            )
+            .await
+            {
                 Ok(inv) => invs.push(inv),
                 Err(e) => {
                     partial = true;
@@ -276,7 +361,7 @@ impl Tool for K8sInventorySync {
         META.get_or_init(|| ToolMeta {
             id: "k8s.inventory.sync".into(),
             name: "Sync Kubernetes inventory via kubectl".into(),
-            description: "Live-fetch pods, services, nodes, namespaces via kubectl into unified K8sInventory cache for pattern search.".into(),
+            description: "Live-fetch pods, services, nodes, namespaces, deployments, ingress, NetworkPolicy, EndpointSlices via kubectl into unified K8sInventory cache for broad/narrow pattern search.".into(),
             domain: ToolDomain::Cluster,
             clouds: vec![Cloud::K8s, Cloud::Multi],
             capability: Capability::Read,
@@ -287,6 +372,7 @@ impl Tool for K8sInventorySync {
                 "kubectl".into(),
                 "cache".into(),
                 "cluster".into(),
+                "pattern".into(),
             ],
             input_schema: json!({
                 "type": "object",
@@ -322,10 +408,14 @@ impl Tool for K8sInventorySync {
                     }
                 } else {
                     for c in &p.clusters {
-                        match sync_and_cache(
+                        let env = cluster_kubectl_env(ctx, c);
+                        let ctx_name = resolve_context_name(c);
+                        match sync_and_cache_with_opts(
                             &ctx.config_dir,
-                            c.context.as_deref().or(Some(c.name.as_str())),
+                            ctx_name.as_deref(),
                             Some(pid),
+                            c.kubeconfig_path.as_deref(),
+                            env,
                         )
                         .await
                         {
@@ -484,6 +574,201 @@ impl Tool for K8sServicesPatternSearch {
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         k8s_pattern(args, ctx, Some("service")).await
+    }
+}
+
+#[async_trait]
+impl Tool for K8sNodesPatternSearch {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "k8s.nodes.pattern.search".into(),
+            name: "Pattern search nodes".into(),
+            description: discovery_blurb("Kubernetes nodes by name or node IP"),
+            domain: ToolDomain::Cluster,
+            clouds: vec![Cloud::K8s, Cloud::Multi],
+            capability: Capability::Read,
+            tags: vec![
+                "k8s".into(),
+                "node".into(),
+                "pattern".into(),
+                "search".into(),
+                "ip".into(),
+                "status".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        k8s_pattern(args, ctx, Some("node")).await
+    }
+}
+
+#[async_trait]
+impl Tool for K8sNamespacesPatternSearch {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "k8s.namespaces.pattern.search".into(),
+            name: "Pattern search namespaces".into(),
+            description: discovery_blurb("Kubernetes namespaces by name fragment"),
+            domain: ToolDomain::Cluster,
+            clouds: vec![Cloud::K8s, Cloud::Multi],
+            capability: Capability::Read,
+            tags: vec![
+                "k8s".into(),
+                "namespace".into(),
+                "pattern".into(),
+                "search".into(),
+                "partial".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        k8s_pattern(args, ctx, Some("namespace")).await
+    }
+}
+
+#[async_trait]
+impl Tool for K8sDeploymentsPatternSearch {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "k8s.deployments.pattern.search".into(),
+            name: "Pattern search deployments".into(),
+            description: discovery_blurb("Kubernetes deployments by name, namespace, or label"),
+            domain: ToolDomain::Cluster,
+            clouds: vec![Cloud::K8s, Cloud::Multi],
+            capability: Capability::Read,
+            tags: vec![
+                "k8s".into(),
+                "deployment".into(),
+                "pattern".into(),
+                "search".into(),
+                "workload".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        k8s_pattern(args, ctx, Some("deployment")).await
+    }
+}
+
+#[async_trait]
+impl Tool for K8sIngressPatternSearch {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "k8s.ingress.pattern.search".into(),
+            name: "Pattern search ingress".into(),
+            description: discovery_blurb("Kubernetes Ingress by name, namespace, or label"),
+            domain: ToolDomain::Cluster,
+            clouds: vec![Cloud::K8s, Cloud::Multi],
+            capability: Capability::Read,
+            tags: vec![
+                "k8s".into(),
+                "ingress".into(),
+                "pattern".into(),
+                "search".into(),
+                "http".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        k8s_pattern(args, ctx, Some("ingress")).await
+    }
+}
+
+#[async_trait]
+impl Tool for K8sNetworkPolicyPatternSearch {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "k8s.networkpolicy.pattern.search".into(),
+            name: "Pattern search NetworkPolicies".into(),
+            description: discovery_blurb(
+                "Kubernetes NetworkPolicy by name or namespace (pair with k8s.networkpolicy.deny.narrative)",
+            ),
+            domain: ToolDomain::Cluster,
+            clouds: vec![Cloud::K8s, Cloud::Multi],
+            capability: Capability::Read,
+            tags: vec![
+                "k8s".into(),
+                "networkpolicy".into(),
+                "pattern".into(),
+                "search".into(),
+                "firewall".into(),
+                "connectivity".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        k8s_pattern(args, ctx, Some("networkpolicy")).await
+    }
+}
+
+#[async_trait]
+impl Tool for K8sEndpointsPatternSearch {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "k8s.endpoints.pattern.search".into(),
+            name: "Pattern search EndpointSlices".into(),
+            description: discovery_blurb(
+                "Kubernetes EndpointSlices by name, service label, or backend pod IP — narrow after services.pattern",
+            ),
+            domain: ToolDomain::Cluster,
+            clouds: vec![Cloud::K8s, Cloud::Multi],
+            capability: Capability::Read,
+            tags: vec![
+                "k8s".into(),
+                "endpoints".into(),
+                "endpointslice".into(),
+                "pattern".into(),
+                "search".into(),
+                "ip".into(),
+                "service".into(),
+                "connectivity".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        k8s_pattern(args, ctx, Some("endpointslice")).await
     }
 }
 

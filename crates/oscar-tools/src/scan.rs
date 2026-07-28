@@ -1,9 +1,10 @@
 //! Run pattern matchers over DNS / network / k8s inventories.
 
 use crate::inventory::{
-    AddressEntry, DnsInventory, DnsRecordEntry, DnsResolverInventory, DnsZoneEntry, K8sInventory,
-    K8sResourceEntry, NetworkInventory, ResolverEndpointEntry, ResolverRuleEntry, SubnetEntry,
-    VpcEntry,
+    AddressEntry, DnsInventory, DnsRecordEntry, DnsResolverInventory, DnsZoneEntry, FunctionEntry,
+    K8sInventory, K8sResourceEntry, NaclEntry, NetworkInventory, NetworkServiceEntry,
+    ResolverEndpointEntry, ResolverRuleEntry, RouteEntry, RouteTableEntry, SecurityGroupEntry,
+    SubnetEntry, VpcEntry,
 };
 use oscar_core::{
     best_field_match, match_text, Cloud, DiscoveryHit, DiscoveryResult, MatchMode, PatternQuery,
@@ -17,22 +18,28 @@ pub fn scan_dns_inventory(inv: &DnsInventory, q: &PatternQuery) -> DiscoveryResu
         q.mode,
         format!("dns:{}:{}", inv.cloud, inv.profile_id),
     );
+    // Partial name search also tries ip_or_cidr on record values (and vice versa).
+    let modes = dual_modes(q.mode);
 
     for zone in &inv.zones {
-        if let Some((field, value, score)) = best_field_match(
-            &q.pattern,
-            q.mode,
-            &[
-                ("zone_name", zone.name.as_str()),
-                ("zone_id", zone.id.as_str()),
-            ],
-        ) {
-            result.hits.push(hit_dns_zone(inv, zone, field, value, score));
+        for mode in &modes {
+            if let Some((field, value, score)) = best_field_match(
+                &q.pattern,
+                *mode,
+                &[
+                    ("zone_name", zone.name.as_str()),
+                    ("zone_id", zone.id.as_str()),
+                ],
+            ) {
+                result
+                    .hits
+                    .push(hit_dns_zone(inv, zone, field, value, score));
+                break;
+            }
         }
 
-        // Also allow IP mode against record values inside the zone.
         for rec in &zone.records {
-            push_dns_record_hits(&mut result, inv, zone, rec, q);
+            push_dns_record_hits(&mut result, inv, zone, rec, q, &modes);
         }
 
         if result.hits.len() >= q.limit * 2 {
@@ -76,28 +83,36 @@ fn push_dns_record_hits(
     zone: &DnsZoneEntry,
     rec: &DnsRecordEntry,
     q: &PatternQuery,
+    modes: &[MatchMode],
 ) {
     let mut fields: Vec<(&str, String)> = vec![
         ("record_name", rec.name.clone()),
         ("record_type", rec.record_type.clone()),
         ("zone_name", zone.name.clone()),
     ];
-    for (i, v) in rec.values.iter().enumerate() {
-        fields.push((
-            if i == 0 { "record_value" } else { "record_value" },
-            v.clone(),
-        ));
+    for v in &rec.values {
+        fields.push(("record_value", v.clone()));
     }
     let field_refs: Vec<(&str, &str)> = fields
         .iter()
         .map(|(k, v)| (*k, v.as_str()))
         .collect();
 
-    // Prefer name matching unless mode is IP-focused.
-    let mode = q.mode;
-    if let Some((field, value, mut score)) = best_field_match(&q.pattern, mode, &field_refs) {
+    // Try partial first, then ip_or_cidr (or reverse) so name fragments and IP targets both hit.
+    let mut matched: Option<(String, String, u32)> = None;
+    for mode in modes {
+        if let Some(hit) = best_field_match(&q.pattern, *mode, &field_refs) {
+            matched = Some(hit);
+            break;
+        }
+    }
+    if let Some((field, value, mut score)) = matched {
         // Boost when both name and zone align with a FQDN-ish query.
-        if rec.name.to_ascii_lowercase().contains(&q.pattern.to_ascii_lowercase()) {
+        if rec
+            .name
+            .to_ascii_lowercase()
+            .contains(&q.pattern.to_ascii_lowercase())
+        {
             score = score.saturating_add(5).min(100);
         }
         let mut attrs = serde_json::Map::new();
@@ -527,9 +542,150 @@ pub fn scan_network_inventory(inv: &NetworkInventory, q: &PatternQuery) -> Disco
             }
         }
     }
+    for sg in &inv.security_groups {
+        for mode in &modes {
+            if let Some(hit) = match_security_group(inv, sg, q, *mode) {
+                result.hits.push(hit);
+                break;
+            }
+        }
+    }
+    for nacl in &inv.nacls {
+        for mode in &modes {
+            if let Some(hit) = match_nacl(inv, nacl, q, *mode) {
+                result.hits.push(hit);
+                break;
+            }
+        }
+    }
+    for rt in &inv.route_tables {
+        for mode in &modes {
+            if let Some(hit) = match_route_table(inv, rt, q, *mode) {
+                result.hits.push(hit);
+                break;
+            }
+        }
+    }
+    for route in &inv.routes {
+        for mode in &modes {
+            if let Some(hit) = match_route(inv, route, q, *mode) {
+                result.hits.push(hit);
+                break;
+            }
+        }
+    }
+    for func in &inv.functions {
+        for mode in &modes {
+            if let Some(hit) = match_function(inv, func, q, *mode) {
+                result.hits.push(hit);
+                break;
+            }
+        }
+    }
+    for svc in &inv.services {
+        for mode in &modes {
+            if let Some(hit) = match_network_service(inv, svc, q, *mode) {
+                result.hits.push(hit);
+                break;
+            }
+        }
+    }
 
     result.hits.truncate(q.limit);
     result.finalize()
+}
+
+/// Map inventory `service_type` string → discovery ResourceKind.
+pub fn service_type_to_kind(service_type: &str) -> ResourceKind {
+    match service_type.to_ascii_lowercase().as_str() {
+        "peering" | "vpc_peering" | "vnet_peering" | "network_peering" => ResourceKind::Peering,
+        "transit_gateway" | "tgw" | "virtual_hub" | "ncc_hub" | "vwan" => {
+            ResourceKind::TransitGateway
+        }
+        "vpn" | "vpn_connection" | "vpn_gateway" | "vpn_tunnel" | "client_vpn" => {
+            ResourceKind::Vpn
+        }
+        "hybrid" | "direct_connect" | "dx" | "expressroute" | "interconnect" | "cross_cloud" => {
+            ResourceKind::HybridConnection
+        }
+        "private_endpoint"
+        | "vpc_endpoint"
+        | "privatelink"
+        | "private_service_connect"
+        | "psc"
+        | "private_link_service" => ResourceKind::PrivateEndpoint,
+        "nat" | "nat_gateway" | "cloud_nat" => ResourceKind::NatGateway,
+        "igw" | "internet_gateway" | "eigw" | "egress_only_internet_gateway" => {
+            ResourceKind::InternetGateway
+        }
+        "share" | "network_share" | "ram" | "shared_vpc" | "host_project" => {
+            ResourceKind::NetworkShare
+        }
+        "prefix_list" | "managed_prefix_list" | "ip_group" => ResourceKind::PrefixList,
+        "load_balancer" | "elb" | "alb" | "nlb" | "gclb" | "application_gateway" => {
+            ResourceKind::LoadBalancer
+        }
+        _ => ResourceKind::Other,
+    }
+}
+
+fn match_network_service(
+    inv: &NetworkInventory,
+    svc: &NetworkServiceEntry,
+    q: &PatternQuery,
+    mode: MatchMode,
+) -> Option<DiscoveryHit> {
+    let name = svc.name.as_deref().unwrap_or("");
+    let mut fields = vec![
+        ("id", svc.id.as_str()),
+        ("name", name),
+        ("service_type", svc.service_type.as_str()),
+        ("status", svc.status.as_deref().unwrap_or("")),
+        ("vpc_id", svc.vpc_id.as_deref().unwrap_or("")),
+        ("description", svc.description.as_deref().unwrap_or("")),
+    ];
+    let related: Vec<&str> = svc.related_ids.iter().map(|s| s.as_str()).collect();
+    for r in &related {
+        fields.push(("related", *r));
+    }
+    let cidrs: Vec<&str> = svc.cidrs.iter().map(|s| s.as_str()).collect();
+    for c in &cidrs {
+        fields.push(("cidr", *c));
+    }
+    let (field, value, score) = best_field_match(&q.pattern, mode, &fields)?;
+    let mut attrs = serde_json::Map::new();
+    attrs.insert("service_type".into(), json!(svc.service_type));
+    if let Some(s) = &svc.status {
+        attrs.insert("status".into(), json!(s));
+    }
+    if let Some(v) = &svc.vpc_id {
+        attrs.insert("vpc_id".into(), json!(v));
+    }
+    if !svc.related_ids.is_empty() {
+        attrs.insert("related_ids".into(), json!(svc.related_ids));
+    }
+    if !svc.cidrs.is_empty() {
+        attrs.insert("cidrs".into(), json!(svc.cidrs));
+    }
+    if let Some(d) = &svc.description {
+        attrs.insert("description".into(), json!(d));
+    }
+    Some(DiscoveryHit {
+        kind: service_type_to_kind(&svc.service_type),
+        cloud: inv.cloud,
+        profile_id: Some(inv.profile_id.clone()),
+        region: svc.region.clone().or_else(|| inv.region.clone()),
+        name: if name.is_empty() {
+            svc.id.clone()
+        } else {
+            name.to_string()
+        },
+        id: Some(svc.id.clone()),
+        matched_field: field,
+        matched_value: value,
+        score,
+        attrs,
+    })
 }
 
 fn dual_modes(mode: MatchMode) -> Vec<MatchMode> {
@@ -661,6 +817,218 @@ fn match_address(
     })
 }
 
+fn match_security_group(
+    inv: &NetworkInventory,
+    sg: &SecurityGroupEntry,
+    q: &PatternQuery,
+    mode: MatchMode,
+) -> Option<DiscoveryHit> {
+    let name = sg.name.as_deref().unwrap_or("");
+    let fields = [
+        ("id", sg.id.as_str()),
+        ("name", name),
+        ("description", sg.description.as_deref().unwrap_or("")),
+        ("vpc_id", sg.vpc_id.as_deref().unwrap_or("")),
+    ];
+    let (field, value, score) = best_field_match(&q.pattern, mode, &fields)?;
+    let mut attrs = serde_json::Map::new();
+    if let Some(v) = &sg.vpc_id {
+        attrs.insert("vpc_id".into(), json!(v));
+    }
+    if let Some(d) = &sg.description {
+        attrs.insert("description".into(), json!(d));
+    }
+    Some(DiscoveryHit {
+        kind: ResourceKind::SecurityGroup,
+        cloud: inv.cloud,
+        profile_id: Some(inv.profile_id.clone()),
+        region: sg.region.clone().or_else(|| inv.region.clone()),
+        name: if name.is_empty() {
+            sg.id.clone()
+        } else {
+            name.to_string()
+        },
+        id: Some(sg.id.clone()),
+        matched_field: field,
+        matched_value: value,
+        score,
+        attrs,
+    })
+}
+
+fn match_nacl(
+    inv: &NetworkInventory,
+    nacl: &NaclEntry,
+    q: &PatternQuery,
+    mode: MatchMode,
+) -> Option<DiscoveryHit> {
+    let name = nacl.name.as_deref().unwrap_or("");
+    let fields = [
+        ("id", nacl.id.as_str()),
+        ("name", name),
+        ("vpc_id", nacl.vpc_id.as_deref().unwrap_or("")),
+    ];
+    let (field, value, score) = best_field_match(&q.pattern, mode, &fields)?;
+    let mut attrs = serde_json::Map::new();
+    if let Some(v) = &nacl.vpc_id {
+        attrs.insert("vpc_id".into(), json!(v));
+    }
+    if let Some(d) = nacl.is_default {
+        attrs.insert("is_default".into(), json!(d));
+    }
+    Some(DiscoveryHit {
+        kind: ResourceKind::Nacl,
+        cloud: inv.cloud,
+        profile_id: Some(inv.profile_id.clone()),
+        region: nacl.region.clone().or_else(|| inv.region.clone()),
+        name: if name.is_empty() {
+            nacl.id.clone()
+        } else {
+            name.to_string()
+        },
+        id: Some(nacl.id.clone()),
+        matched_field: field,
+        matched_value: value,
+        score,
+        attrs,
+    })
+}
+
+fn match_route_table(
+    inv: &NetworkInventory,
+    rt: &RouteTableEntry,
+    q: &PatternQuery,
+    mode: MatchMode,
+) -> Option<DiscoveryHit> {
+    let name = rt.name.as_deref().unwrap_or("");
+    let mut fields = vec![
+        ("id", rt.id.as_str()),
+        ("name", name),
+        ("vpc_id", rt.vpc_id.as_deref().unwrap_or("")),
+    ];
+    let dests: Vec<&str> = rt.destinations.iter().map(|s| s.as_str()).collect();
+    for d in &dests {
+        fields.push(("destination", *d));
+    }
+    let targets: Vec<&str> = rt.targets.iter().map(|s| s.as_str()).collect();
+    for t in &targets {
+        fields.push(("target", *t));
+    }
+    let (field, value, score) = best_field_match(&q.pattern, mode, &fields)?;
+    let mut attrs = serde_json::Map::new();
+    if let Some(v) = &rt.vpc_id {
+        attrs.insert("vpc_id".into(), json!(v));
+    }
+    if !rt.destinations.is_empty() {
+        attrs.insert("destinations".into(), json!(rt.destinations));
+    }
+    if !rt.targets.is_empty() {
+        attrs.insert("targets".into(), json!(rt.targets));
+    }
+    Some(DiscoveryHit {
+        kind: ResourceKind::RouteTable,
+        cloud: inv.cloud,
+        profile_id: Some(inv.profile_id.clone()),
+        region: rt.region.clone().or_else(|| inv.region.clone()),
+        name: if name.is_empty() {
+            rt.id.clone()
+        } else {
+            name.to_string()
+        },
+        id: Some(rt.id.clone()),
+        matched_field: field,
+        matched_value: value,
+        score,
+        attrs,
+    })
+}
+
+fn match_route(
+    inv: &NetworkInventory,
+    route: &RouteEntry,
+    q: &PatternQuery,
+    mode: MatchMode,
+) -> Option<DiscoveryHit> {
+    let name = route.name.as_deref().unwrap_or("");
+    let fields = [
+        ("id", route.id.as_str()),
+        ("name", name),
+        ("destination", route.destination.as_str()),
+        ("target", route.target.as_deref().unwrap_or("")),
+        ("route_table_id", route.route_table_id.as_str()),
+        ("vpc_id", route.vpc_id.as_deref().unwrap_or("")),
+    ];
+    let (field, value, score) = best_field_match(&q.pattern, mode, &fields)?;
+    let mut attrs = serde_json::Map::new();
+    attrs.insert("destination".into(), json!(route.destination));
+    attrs.insert("route_table_id".into(), json!(route.route_table_id));
+    if let Some(t) = &route.target {
+        attrs.insert("target".into(), json!(t));
+    }
+    if let Some(v) = &route.vpc_id {
+        attrs.insert("vpc_id".into(), json!(v));
+    }
+    Some(DiscoveryHit {
+        kind: ResourceKind::Route,
+        cloud: inv.cloud,
+        profile_id: Some(inv.profile_id.clone()),
+        region: route.region.clone().or_else(|| inv.region.clone()),
+        name: if name.is_empty() {
+            route.destination.clone()
+        } else {
+            name.to_string()
+        },
+        id: Some(route.id.clone()),
+        matched_field: field,
+        matched_value: value,
+        score,
+        attrs,
+    })
+}
+
+fn match_function(
+    inv: &NetworkInventory,
+    func: &FunctionEntry,
+    q: &PatternQuery,
+    mode: MatchMode,
+) -> Option<DiscoveryHit> {
+    let name = func.name.as_deref().unwrap_or("");
+    let fields = [
+        ("id", func.id.as_str()),
+        ("name", name),
+        ("runtime", func.runtime.as_deref().unwrap_or("")),
+        ("vpc_id", func.vpc_id.as_deref().unwrap_or("")),
+        ("arn", func.arn_or_url.as_deref().unwrap_or("")),
+    ];
+    let (field, value, score) = best_field_match(&q.pattern, mode, &fields)?;
+    let mut attrs = serde_json::Map::new();
+    if let Some(r) = &func.runtime {
+        attrs.insert("runtime".into(), json!(r));
+    }
+    if let Some(v) = &func.vpc_id {
+        attrs.insert("vpc_id".into(), json!(v));
+    }
+    if let Some(a) = &func.arn_or_url {
+        attrs.insert("arn_or_url".into(), json!(a));
+    }
+    Some(DiscoveryHit {
+        kind: ResourceKind::Function,
+        cloud: inv.cloud,
+        profile_id: Some(inv.profile_id.clone()),
+        region: func.region.clone().or_else(|| inv.region.clone()),
+        name: if name.is_empty() {
+            func.id.clone()
+        } else {
+            name.to_string()
+        },
+        id: Some(func.id.clone()),
+        matched_field: field,
+        matched_value: value,
+        score,
+        attrs,
+    })
+}
+
 pub fn scan_k8s_inventory(inv: &K8sInventory, q: &PatternQuery) -> DiscoveryResult {
     let scope = format!(
         "k8s:{}",
@@ -757,6 +1125,8 @@ fn map_k8s_kind(kind: &str) -> ResourceKind {
         "configmap" | "configmaps" | "cm" => ResourceKind::K8sConfigMap,
         "secret" | "secrets" => ResourceKind::K8sSecret,
         "node" | "nodes" => ResourceKind::K8sNode,
+        "networkpolicy" | "networkpolicies" | "netpol" => ResourceKind::K8sOther,
+        "endpointslice" | "endpointslices" | "endpoints" | "endpoint" => ResourceKind::K8sService,
         _ => ResourceKind::K8sOther,
     }
 }
@@ -867,6 +1237,46 @@ mod tests {
                 region: Some("us-east-1".into()),
             }],
             addresses: vec![],
+            security_groups: vec![SecurityGroupEntry {
+                id: "sg-app".into(),
+                name: Some("app-web".into()),
+                description: Some("web tier".into()),
+                vpc_id: Some("vpc-1".into()),
+                region: Some("us-east-1".into()),
+            }],
+            nacls: vec![NaclEntry {
+                id: "acl-1".into(),
+                name: Some("private-nacl".into()),
+                vpc_id: Some("vpc-1".into()),
+                is_default: Some(false),
+                region: Some("us-east-1".into()),
+            }],
+            route_tables: vec![RouteTableEntry {
+                id: "rtb-1".into(),
+                name: Some("public-rt".into()),
+                vpc_id: Some("vpc-1".into()),
+                region: Some("us-east-1".into()),
+                destinations: vec!["0.0.0.0/0".into(), "10.0.0.0/16".into()],
+                targets: vec!["igw-1".into()],
+            }],
+            routes: vec![RouteEntry {
+                id: "rtb-1:0.0.0.0/0".into(),
+                name: Some("default".into()),
+                route_table_id: "rtb-1".into(),
+                destination: "0.0.0.0/0".into(),
+                target: Some("igw-1".into()),
+                vpc_id: Some("vpc-1".into()),
+                region: Some("us-east-1".into()),
+            }],
+            functions: vec![FunctionEntry {
+                id: "arn:aws:lambda:us-east-1:1:function:api-handler".into(),
+                name: Some("api-handler".into()),
+                runtime: Some("python3.12".into()),
+                region: Some("us-east-1".into()),
+                vpc_id: Some("vpc-1".into()),
+                arn_or_url: Some("arn:aws:lambda:us-east-1:1:function:api-handler".into()),
+            }],
+            services: vec![],
         };
         let q = PatternQuery {
             pattern: "10.0.4".into(),
@@ -877,5 +1287,103 @@ mod tests {
         };
         let r = scan_network_inventory(&inv, &q);
         assert!(r.hits.iter().any(|h| h.kind == ResourceKind::Subnet));
+    }
+
+    #[test]
+    fn pattern_hits_sg_nacl_rt_route_function() {
+        let inv = NetworkInventory {
+            profile_id: "aws-prod".into(),
+            cloud: Cloud::Aws,
+            region: Some("us-east-1".into()),
+            vpcs: vec![],
+            subnets: vec![],
+            addresses: vec![],
+            security_groups: vec![SecurityGroupEntry {
+                id: "sg-app".into(),
+                name: Some("app-web".into()),
+                description: Some("web".into()),
+                vpc_id: None,
+                region: None,
+            }],
+            nacls: vec![NaclEntry {
+                id: "acl-1".into(),
+                name: Some("private-nacl".into()),
+                vpc_id: None,
+                is_default: None,
+                region: None,
+            }],
+            route_tables: vec![RouteTableEntry {
+                id: "rtb-1".into(),
+                name: Some("public-rt".into()),
+                vpc_id: None,
+                region: None,
+                destinations: vec!["0.0.0.0/0".into()],
+                targets: vec![],
+            }],
+            routes: vec![RouteEntry {
+                id: "rtb-1:10.1.0.0/16".into(),
+                name: None,
+                route_table_id: "rtb-1".into(),
+                destination: "10.1.0.0/16".into(),
+                target: Some("pcx-1".into()),
+                vpc_id: None,
+                region: None,
+            }],
+            functions: vec![FunctionEntry {
+                id: "fn-1".into(),
+                name: Some("api-handler".into()),
+                runtime: Some("nodejs20.x".into()),
+                region: None,
+                vpc_id: None,
+                arn_or_url: None,
+            }],
+            services: vec![
+                NetworkServiceEntry {
+                    id: "pcx-1".into(),
+                    name: Some("app-to-shared".into()),
+                    service_type: "peering".into(),
+                    status: Some("active".into()),
+                    vpc_id: Some("vpc-1".into()),
+                    related_ids: vec!["vpc-2".into()],
+                    cidrs: vec!["10.2.0.0/16".into()],
+                    region: None,
+                    description: Some("vpc peering".into()),
+                },
+                NetworkServiceEntry {
+                    id: "tgw-1".into(),
+                    name: Some("hub-tgw".into()),
+                    service_type: "transit_gateway".into(),
+                    status: Some("available".into()),
+                    vpc_id: None,
+                    related_ids: vec![],
+                    cidrs: vec![],
+                    region: None,
+                    description: None,
+                },
+            ],
+        };
+        for (pat, kind) in [
+            ("app-web", ResourceKind::SecurityGroup),
+            ("private-nacl", ResourceKind::Nacl),
+            ("public-rt", ResourceKind::RouteTable),
+            ("10.1.0", ResourceKind::Route),
+            ("api-handler", ResourceKind::Function),
+            ("app-to-shared", ResourceKind::Peering),
+            ("hub-tgw", ResourceKind::TransitGateway),
+        ] {
+            let q = PatternQuery {
+                pattern: pat.into(),
+                mode: MatchMode::Partial,
+                profile_id: None,
+                region: None,
+                limit: 20,
+            };
+            let r = scan_network_inventory(&inv, &q);
+            assert!(
+                r.hits.iter().any(|h| h.kind == kind),
+                "pattern {pat} should hit {kind:?}, hits={:?}",
+                r.hits
+            );
+        }
     }
 }

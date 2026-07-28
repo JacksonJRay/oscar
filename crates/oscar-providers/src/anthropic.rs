@@ -1,5 +1,8 @@
 //! Native Anthropic Messages API (`/v1/messages`) with SSE streaming + tools + thinking.
 
+use crate::http::{
+    format_reqwest_error, shared_client, CHAT_REQUEST_TIMEOUT, STREAM_IDLE_TIMEOUT,
+};
 use crate::sse::SseDataStream;
 use crate::traits::{
     BoxStream, ChatRequest, ChatResponse, LlmProvider, ModelInfo, ProviderError, ProviderStreamEvent,
@@ -41,7 +44,7 @@ impl AnthropicProvider {
                 .to_string(),
             api_key: api_key.into(),
             models: models.unwrap_or_else(Self::default_models),
-            client: Client::new(),
+            client: shared_client(),
             api_version: DEFAULT_VERSION.into(),
         }
     }
@@ -368,15 +371,16 @@ impl LlmProvider for AnthropicProvider {
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", &self.api_version)
             .header("content-type", "application/json")
+            .timeout(CHAT_REQUEST_TIMEOUT)
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProviderError::Http(e.to_string()))?;
+            .map_err(|e| ProviderError::Http(format_reqwest_error(&e)))?;
         let status = resp.status();
         let text = resp
             .text()
             .await
-            .map_err(|e| ProviderError::Http(e.to_string()))?;
+            .map_err(|e| ProviderError::Http(format_reqwest_error(&e)))?;
         if !status.is_success() {
             return Err(ProviderError::Http(format!("{status}: {text}")));
         }
@@ -399,10 +403,11 @@ impl LlmProvider for AnthropicProvider {
             .header("anthropic-version", &self.api_version)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
+            .header("cache-control", "no-cache")
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProviderError::Http(e.to_string()))?;
+            .map_err(|e| ProviderError::Http(format_reqwest_error(&e)))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -419,10 +424,21 @@ impl LlmProvider for AnthropicProvider {
                 std::collections::HashMap::new();
             let mut current_block_type = String::new();
             let mut current_tool_id = String::new();
-            let mut current_tool_name = String::new();
             let mut stop_reason = String::from("end_turn");
+            let mut saw_message_stop = false;
 
-            while let Some(item) = sse.next().await {
+            loop {
+                let item = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, sse.next()).await {
+                    Ok(Some(item)) => item,
+                    Ok(None) => break,
+                    Err(_) => {
+                        yield ProviderStreamEvent::Error(format!(
+                            "stream idle timeout after {}s with no SSE data",
+                            STREAM_IDLE_TIMEOUT.as_secs()
+                        ));
+                        break;
+                    }
+                };
                 let data = match item {
                     Ok(d) => d,
                     Err(e) => {
@@ -459,18 +475,18 @@ impl LlmProvider for AnthropicProvider {
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            current_tool_name = block
+                            let tool_name = block
                                 .get("name")
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("")
                                 .to_string();
                             tool_bufs.insert(
                                 current_tool_id.clone(),
-                                (current_tool_name.clone(), String::new()),
+                                (tool_name.clone(), String::new()),
                             );
                             yield ProviderStreamEvent::ToolCallDelta {
                                 id: current_tool_id.clone(),
-                                name: Some(current_tool_name.clone()),
+                                name: Some(tool_name),
                                 args_delta: String::new(),
                             };
                         }
@@ -577,6 +593,7 @@ impl LlmProvider for AnthropicProvider {
                             "max_tokens" => FinishReason::Length,
                             _ => FinishReason::Stop,
                         };
+                        saw_message_stop = true;
                         yield ProviderStreamEvent::MessageStop {
                             finish_reason: finish,
                         };
@@ -592,11 +609,39 @@ impl LlmProvider for AnthropicProvider {
                     _ => {}
                 }
             }
+
+            // Stream ended without message_stop — flush any open tool_use and stop.
+            // (Same end-of-stream guarantee as OpenAI-compat / Grok Build.)
+            if !tool_bufs.is_empty() {
+                for (id, (name, args_buf)) in tool_bufs.drain() {
+                    let arguments: Value =
+                        serde_json::from_str(&args_buf).unwrap_or(json!({}));
+                    yield ProviderStreamEvent::ToolCallDone(ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    });
+                }
+                if stop_reason == "end_turn" {
+                    stop_reason = "tool_use".into();
+                }
+            }
+            if !saw_message_stop {
+                let finish = match stop_reason.as_str() {
+                    "tool_use" => FinishReason::ToolCalls,
+                    "max_tokens" => FinishReason::Length,
+                    _ => FinishReason::Stop,
+                };
+                yield ProviderStreamEvent::MessageStop {
+                    finish_reason: finish,
+                };
+            }
         };
 
         Ok(Box::pin(stream))
     }
 }
+
 
 #[cfg(test)]
 mod tests {

@@ -34,7 +34,8 @@ pub fn pattern_properties() -> Value {
 pub fn discovery_tool_result(result: DiscoveryResult) -> oscar_tools_result::Ready {
     let summary = if result.hit_count == 0 {
         format!(
-            "No matches for pattern `{}` ({}) in {}",
+            "No matches for pattern `{}` ({}) in {} — tell the user you could not find it (include profile/account if known). \
+             If inventory may be empty/stale, suggest inventory.sync then re-search, or verify profile keys target the right account.",
             result.pattern, result.mode, result.query_scope
         )
     } else {
@@ -85,7 +86,7 @@ pub fn to_tool_result(ready: DiscoveryReady) -> crate::ToolResult {
 /// Short description snippet for discovery tools.
 pub fn discovery_blurb(resource: &str) -> String {
     format!(
-        "High-accuracy pattern discovery for {resource}. Supports partial, prefix, suffix, exact, glob (*?), and IP/CIDR match. Prefer this over multi-step list+filter — returns ranked hits with resource ids for the agent."
+        "High-accuracy pattern discovery for {resource}. Default match is partial (substring); also supports prefix, suffix, exact, glob (*?), and IP/CIDR. Prefer short name fragments over exact FQDNs — returns ranked hits with resource ids for the agent."
     )
 }
 

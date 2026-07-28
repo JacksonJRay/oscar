@@ -4,7 +4,12 @@
 //! 1. `./.oscar/skills/` (cwd / project)
 //! 2. `~/.config/oscar/skills/` (user)
 //! 3. Built-in skills shipped with oscar
+//!
+//! Progressive disclosure (Grok Build / OpenCode-aligned):
+//! - Catalog / search exposes **name + description** only
+//! - Full body loads only via `system.skills.get` or `tools_execute` `skill.<name>`
 
+use crate::error::{OscarError, OscarResult};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -137,6 +142,7 @@ pub fn builtin_skills() -> Vec<Skill> {
         parse_skill_md(BUILTIN_K8S_CNI, "k8s-cni-connectivity", "builtin", None),
         parse_skill_md(BUILTIN_DISCOVERY_INTENT, "discovery-intent", "builtin", None),
         parse_skill_md(BUILTIN_PERMISSION_TEST, "permission-test-plan", "builtin", None),
+        parse_skill_md(BUILTIN_CREATE_PLAYBOOK, "create-playbook", "builtin", None),
     ]
 }
 
@@ -222,39 +228,182 @@ fn load_skills_dir(dir: &Path, source: &str, out: &mut std::collections::BTreeMa
 
 pub fn find_skill(name: &str, settings: &SkillsSettings) -> Option<Skill> {
     let n = normalize_name(name);
+    // Accept skill.<name> ids from tools_search
+    let n = n.strip_prefix("skill.").unwrap_or(&n).to_string();
     discover_skills(settings)
         .into_iter()
-        .find(|s| s.name == n || s.name.eq_ignore_ascii_case(name))
+        .find(|s| s.name == n || s.name.eq_ignore_ascii_case(name.trim_start_matches("skill.")))
 }
 
-/// Compact catalog for the system prompt (descriptions only — load body via tools).
+/// Progressive search (Grok/OpenCode-style): match name/description/when-to-use only.
+/// Full body is **never** returned here — load via [`find_skill`] / `system.skills.get`.
+pub fn search_skills(query: &str, settings: &SkillsSettings, limit: usize) -> Vec<Skill> {
+    let q = query.trim().to_ascii_lowercase();
+    let limit = limit.clamp(1, 50);
+    let all = discover_skills(settings);
+    if q.is_empty() {
+        return all.into_iter().take(limit).collect();
+    }
+    let tokens: Vec<&str> = q
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+        .filter(|t| t.len() >= 2)
+        .collect();
+    let mut scored: Vec<(i32, Skill)> = all
+        .into_iter()
+        .filter_map(|s| {
+            if s.disable_model_invocation {
+                return None;
+            }
+            let hay = format!(
+                "{} {} {}",
+                s.name,
+                s.description,
+                s.when_to_use.as_deref().unwrap_or("")
+            )
+            .to_ascii_lowercase();
+            let mut score = 0i32;
+            if s.name == q || s.name.contains(&q) {
+                score += 100;
+            }
+            if hay.contains(&q) {
+                score += 40;
+            }
+            for t in &tokens {
+                if s.name.contains(t) {
+                    score += 25;
+                } else if hay.contains(t) {
+                    score += 10;
+                }
+            }
+            if score > 0 {
+                Some((score, s))
+            } else {
+                None
+            }
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    scored.into_iter().take(limit).map(|(_, s)| s).collect()
+}
+
+/// Where to write a newly created skill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillScope {
+    /// `~/.config/oscar/skills/<name>/`
+    User,
+    /// `./.oscar/skills/<name>/` under cwd
+    Project,
+}
+
+impl SkillScope {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "user" | "global" | "home" => Some(Self::User),
+            "project" | "repo" | "local" | "cwd" => Some(Self::Project),
+            _ => None,
+        }
+    }
+}
+
+/// Build canonical SKILL.md text from structured fields.
+pub fn render_skill_md(
+    name: &str,
+    description: &str,
+    when_to_use: Option<&str>,
+    body: &str,
+    allowed_tools: &[String],
+) -> String {
+    let name = normalize_name(name);
+    let mut fm = format!(
+        "---\nname: {name}\ndescription: {}\n",
+        description.replace('\n', " ").trim()
+    );
+    if let Some(w) = when_to_use {
+        let w = w.replace('\n', " ").trim().to_string();
+        if !w.is_empty() {
+            fm.push_str(&format!("when-to-use: {w}\n"));
+        }
+    }
+    if !allowed_tools.is_empty() {
+        fm.push_str("allowed-tools: ");
+        fm.push_str(&allowed_tools.join(", "));
+        fm.push('\n');
+    }
+    fm.push_str("---\n\n");
+    fm.push_str(body.trim());
+    fm.push('\n');
+    fm
+}
+
+/// Write a skill package to disk. Returns absolute path to SKILL.md.
+pub fn write_skill(
+    scope: SkillScope,
+    name: &str,
+    description: &str,
+    when_to_use: Option<&str>,
+    body: &str,
+    allowed_tools: &[String],
+) -> OscarResult<PathBuf> {
+    let name = normalize_name(name);
+    if name.len() < 2 {
+        return Err(OscarError::Config(
+            "skill name too short (use lowercase-hyphen names, 2–64 chars)".into(),
+        ));
+    }
+    let root = match scope {
+        SkillScope::User => user_skills_dir().ok_or_else(|| {
+            OscarError::Config("could not resolve user skills dir (~/.config/oscar/skills)".into())
+        })?,
+        SkillScope::Project => std::env::current_dir()
+            .map_err(|e| OscarError::Config(format!("cwd: {e}")))?
+            .join(".oscar")
+            .join("skills"),
+    };
+    let dir = root.join(&name);
+    fs::create_dir_all(&dir).map_err(OscarError::from)?;
+    let path = dir.join("SKILL.md");
+    let md = render_skill_md(&name, description, when_to_use, body, allowed_tools);
+    fs::write(&path, md).map_err(OscarError::from)?;
+    Ok(path)
+}
+
+/// Compact catalog for the system prompt (name + short description only — never full bodies).
+/// Progressive disclosure: model uses `system.skills.search` / `tools_search` then `system.skills.get`.
 pub fn skills_catalog_prompt(skills: &[Skill]) -> String {
     if skills.is_empty() {
-        return "## Skills\n(no skills discovered — add ~/.config/oscar/skills/<name>/SKILL.md)".into();
+        return "## Skills\n(no skills — create with system.skills.create or ~/.config/oscar/skills/<name>/SKILL.md)".into();
     }
     let mut lines = vec![
-        "## Skills (user steering outside harness)".into(),
-        "Skills are optional playbooks. When a skill applies, call `system.skills.get` with the skill name to load full instructions, then follow them.".into(),
-        "User can also `/skill <name>` to pin a skill into this session.".into(),
+        "## Skills / playbooks (progressive disclosure — like tools_search)".into(),
+        "Catalog is **names + short descriptions only**. Do **not** invent skill bodies.".into(),
+        "When a user task matches a playbook: `system.skills.search` (or tools_search query `skill …`) → **`system.skills.get`** / `tools_execute` tool_id=`skill.<name>` to load full instructions, then follow them.".into(),
+        "User: \"create a playbook/skill for when I say X…\" → **NATIVE `system.skills.create`** (guidance=…) then follow returned body; `/skill <name>` to pin.".into(),
+        "User `/skill <name>` pins a skill into this session.".into(),
         String::new(),
     ];
-    for s in skills {
-        if s.disable_model_invocation {
-            lines.push(format!(
-                "- `{}` [user-only] — {}",
-                s.name, s.description
-            ));
+    // Cap catalog length to avoid context bloat when many user skills exist.
+    let max_list = 40usize;
+    for s in skills.iter().take(max_list) {
+        let desc: String = s.description.chars().take(120).collect();
+        let ellipsis = if s.description.chars().count() > 120 {
+            "…"
         } else {
-            let when = s
-                .when_to_use
-                .as_deref()
-                .map(|w| format!(" | when: {w}"))
-                .unwrap_or_default();
+            ""
+        };
+        if s.disable_model_invocation {
+            lines.push(format!("- `{n}` [user-only] — {desc}{ellipsis}", n = s.name));
+        } else {
             lines.push(format!(
-                "- `{}` ({}) — {}{}",
-                s.name, s.source, s.description, when
+                "- `skill.{}` ({}) — {desc}{ellipsis}",
+                s.name, s.source
             ));
         }
+    }
+    if skills.len() > max_list {
+        lines.push(format!(
+            "- … +{} more — use system.skills.search to find them",
+            skills.len() - max_list
+        ));
     }
     lines.join("\n")
 }
@@ -304,10 +453,14 @@ When recommending network solutions, **prefer VLSM** — right-sized prefixes fo
 - Document supernet vs subnet relationships when troubleshooting overlaps.
 
 ## Path troubleshooting order
-1. Inventory / pattern locate endpoints (`*.network.pattern.search`, `*.ip.locate`).
-2. Sync inventory if cache empty (`*.network.inventory.sync`).
-3. Path tools: AWS Reachability/Access Analyzer, GCP Connectivity Tests, Azure Network Watcher.
-4. Check routes, SG/NSG, NACL, UDR, private endpoints, DNS before blaming the app.
+1. **Playbook:** `network.troubleshoot.playbook` with symptom (dns|timeout|refused|mesh|node|cross_cloud).
+2. Inventory / pattern locate endpoints (`*.network.pattern.search`, `*.ip.locate`, `network.pattern.find`).
+3. Sync inventory if cache empty (`*.network.inventory.sync`).
+4. Path tools: AWS Reachability/Access Analyzer, GCP Connectivity Tests, Azure Network Watcher.
+5. Node: `node.net.status`, `node.net.route.get`, `node.net.ss`, `node.net.ping` / traceroute.
+6. Mesh: `mesh.envoy.diagnose` / clusters / stats (Istio sidecar or admin_url).
+7. BPF: `node.bpf.progs.list`, `node.bpf.net.show` when config looks fine but packets fail.
+8. Check routes, SG/NSG, NACL, UDR, private endpoints, DNS before blaming the app.
 
 ## Findings
 Always include concrete resource IDs, CIDRs, ports, and blockers in the final answer.
@@ -376,6 +529,29 @@ You are authorized to propose a **temporary broad access** experiment **only** a
 6. Prefer not using temporary broad when the needed permission is already obvious (e.g. ListBuckets).
 "#;
 
+const BUILTIN_CREATE_PLAYBOOK: &str = r#"---
+name: create-playbook
+description: Author a new oscar skill/playbook from user guidance (when they say X, do Y). Use when the user asks to create a skill, playbook, or reusable troubleshooting procedure.
+when-to-use: create skill, create playbook, when I say, remember this procedure, playbook for
+---
+
+# Create playbook / skill
+
+When the user wants a reusable procedure ("when I say look for X, output Y…"):
+
+## Steps
+1. Extract trigger phrases, goal, preferred tools, output format.
+2. Call **NATIVE `system.skills.create`** (works in **readonly**). Preferred args:
+   - `guidance`: full user procedure text (single field is enough)
+   - optional: `name`, `description`, `when_to_use`, `body`, `allowed_tools`, `scope`
+3. The result includes **`body`** — **follow it now** for the current task.
+4. Tell the user: `/skill <name>` to pin; later use `system.skills.search` to rediscover.
+
+## Body quality
+- Prefer first-class tools (`tools_search` → `tools_execute`); name tool ids when known.
+- Keep steps short. Never put secrets in the skill file.
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +570,31 @@ mod tests {
         let skills = discover_skills(&SkillsSettings::default());
         assert!(skills.iter().any(|s| s.name == "least-privilege-iam"));
         assert!(skills.iter().any(|s| s.name == "k8s-cni-connectivity"));
+        assert!(skills.iter().any(|s| s.name == "create-playbook"));
+    }
+
+    #[test]
+    fn search_skills_matches_when() {
+        let hits = search_skills("cni kubernetes", &SkillsSettings::default(), 10);
+        assert!(hits.iter().any(|s| s.name == "k8s-cni-connectivity"));
+    }
+
+    #[test]
+    fn write_and_find_skill_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("oscar-skill-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // write_skill uses user/project dirs; test render + parse instead
+        let md = render_skill_md(
+            "website-troubleshoot",
+            "When user says troubleshoot my website, run DNS then path checks.",
+            Some("troubleshoot website, site down, website broken"),
+            "# Steps\n1. dns.pattern.find\n2. network path tools\n",
+            &["dns.pattern.find".into()],
+        );
+        let s = parse_skill_md(&md, "x", "user", None);
+        assert_eq!(s.name, "website-troubleshoot");
+        assert!(s.body.contains("dns.pattern.find"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

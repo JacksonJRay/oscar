@@ -17,10 +17,10 @@ pub struct AwsDnsQueryLogPatternSearch;
 pub struct AwsDnsProfilePatternSearch;
 
 fn needs_aws(ctx: &ToolContext, reason: &str) -> Option<ToolResult> {
-    if ctx.profiles_for(Cloud::Aws, None).is_empty() {
-        Some(ToolResult::needs_auth(auth_for(Cloud::Aws, reason)))
-    } else {
+    if ctx.profiles.list().iter().any(|p| p.cloud == Cloud::Aws) {
         None
+    } else {
+        Some(ToolResult::needs_auth(auth_for(Cloud::Aws, reason)))
     }
 }
 

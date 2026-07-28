@@ -2,9 +2,62 @@
 
 ## How streaming works
 
-1. The agent calls the LLM provider via `chat_stream` (SSE where the API supports it).
-2. Provider-specific frames are normalized to `ProviderStreamEvent` (`ContentDelta`, `ThinkingDelta`, `ToolCall*`, `Usage`, `MessageStop`, `Error`).
-3. The agent loop maps those into `AgentEvent` for the TUI / headless NDJSON consumer.
+Aligned with **Grok Build** (sampler L2 transform) and **OpenCode** (session processor + SSE bus):
+
+1. **Chat input (TUI)** — Enter submits to the host via `user_tx`; host runs `agent.run_turn` while still listening for cancel.
+2. **Provider SSE** — HTTP body → UTF-8 BOM strip → `eventsource-stream` → `data:` payloads (`SseDataStream`).
+3. **Normalize** — Provider frames → `ProviderStreamEvent` (`ContentDelta`, `ThinkingDelta`, `ToolCall*`, `Usage`, `MessageStop`, `Error`).
+4. **Finalize** — Tool call fragments always flush to `ToolCallDone` at finish_reason **or** stream end; `MessageStop` is always emitted (Grok Build pattern: force `ToolCalls` if tools present).
+5. **Agent loop** — Maps stream events → `AgentEvent` for the TUI / headless NDJSON; runs tools then continues the model round.
+
+```
+TUI input ──user_tx──► host ──run_turn──► provider.chat_stream (SSE)
+     │                        │                    │
+     │ (queue if busy)        │◄── AgentEvent ◄────┘
+     └── prompt_queue ────────┘    tools → next model round
+
+oscar serve ──► POST /prompt → same agent loop
+                GET  /event  → SSE of AgentEvent JSON
+```
+
+## Idle timeout
+
+Provider streams abort with `ProviderStreamEvent::Error` if no SSE data arrives for
+**90s** (`STREAM_IDLE_TIMEOUT`). Connect timeout is **20s**. Non-stream `chat` has a
+**180s** overall request timeout.
+
+## Prompt queue
+
+While a turn is streaming, further Enter presses **queue** chat text. On
+`AgentEvent::Done`, the next queued prompt is auto-submitted (slash commands wait
+for idle, except `/quit`).
+
+## Local SSE server (always-on with TUI)
+
+When you run `oscar` (TUI), an SSE hub starts **by default** with a **watchdog**
+that restarts the accept loop if the socket dies.
+
+```toml
+# ~/.config/oscar/config.toml
+[sse]
+enabled = true
+bind = "127.0.0.1:4096"
+watchdog = true
+restart_backoff_ms = 500
+restart_backoff_max_ms = 15000
+```
+
+Env: `OSCAR_SSE_BIND`, `OSCAR_SSE_DISABLE=1`, `OSCAR_SERVE_BIND`.
+
+```bash
+oscar                              # TUI + SSE hub
+curl -N http://127.0.0.1:4096/event
+curl -sS -X POST http://127.0.0.1:4096/prompt -d 'say hi'
+
+oscar serve --bind 127.0.0.1:4096  # headless-only (same hub + watchdog)
+```
+
+Endpoints: `GET /health`, `GET /event` (SSE of `AgentEvent` JSON), `POST /prompt`, `POST /cancel`.
 
 ## Cancel (Esc / Ctrl+C)
 

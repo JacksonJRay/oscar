@@ -515,8 +515,21 @@ impl Agent {
             let stream = match self.provider.chat_stream(req).await {
                 Ok(s) => s,
                 Err(e) => {
-                    // Fallback to non-streaming chat.
-                    warn!("chat_stream failed, falling back to chat: {e}");
+                    // Fallback to non-streaming chat (still surfaces a clear error if both fail).
+                    warn!(
+                        provider = %self.provider.id(),
+                        model = %self.options.model,
+                        error = %e,
+                        "chat_stream failed, falling back to non-stream chat"
+                    );
+                    let _ = tx
+                        .send(AgentEvent::Error {
+                            message: format!(
+                                "stream failed ({}); retrying without SSE…",
+                                e
+                            ),
+                        })
+                        .await;
                     match self
                         .provider
                         .chat(ChatRequest {
@@ -620,6 +633,7 @@ impl Agent {
             let mut tool_calls: Vec<ToolCall> = Vec::new();
             let mut usage: Option<TokenUsage> = None;
             let mut finish = oscar_core::FinishReason::Stop;
+            let mut stream_error = false;
 
             tokio::pin!(stream);
             while let Some(ev) = stream.next().await {
@@ -636,6 +650,8 @@ impl Agent {
                         thinking.push_str(&t);
                         let _ = tx.send(AgentEvent::ThinkingDelta { text: t }).await;
                     }
+                    // Deltas are for UI; tool execution uses ToolCallDone only.
+                    // Providers must flush ToolCallDone at stream end (SSE rebuild).
                     ProviderStreamEvent::ToolCallDelta { .. } => {}
                     ProviderStreamEvent::ToolCallDone(tc) => {
                         tool_calls.push(tc);
@@ -648,6 +664,7 @@ impl Agent {
                         finish = finish_reason;
                     }
                     ProviderStreamEvent::Error(e) => {
+                        stream_error = true;
                         let _ = tx.send(AgentEvent::Error { message: e }).await;
                     }
                 }
@@ -659,6 +676,19 @@ impl Agent {
                         chars: thinking.len(),
                     })
                     .await;
+            }
+
+            // Grok Build: if any tools arrived, treat as tool_calls even when
+            // finish_reason was missing/stop (providers sometimes omit it).
+            if !tool_calls.is_empty()
+                && !matches!(
+                    finish,
+                    oscar_core::FinishReason::ToolCalls
+                        | oscar_core::FinishReason::Cancelled
+                        | oscar_core::FinishReason::Error
+                )
+            {
+                finish = oscar_core::FinishReason::ToolCalls;
             }
 
             let assistant = Message {
@@ -675,59 +705,46 @@ impl Agent {
             };
             self.session.messages.push(assistant);
 
-            if tool_calls.is_empty()
-                || matches!(
+            // Terminal: no tools, cancel, error, or empty tool_calls with non-tool finish.
+            let should_run_tools = !tool_calls.is_empty()
+                && !stream_error
+                && !matches!(
                     finish,
-                    oscar_core::FinishReason::Stop
-                        | oscar_core::FinishReason::Length
-                        | oscar_core::FinishReason::Cancelled
-                        | oscar_core::FinishReason::Error
-                ) && !matches!(finish, oscar_core::FinishReason::ToolCalls)
-                    && tool_calls.is_empty()
-            {
-                // If finish says tool_calls but empty, still end.
-                if !matches!(finish, oscar_core::FinishReason::ToolCalls) || tool_calls.is_empty() {
-                    let snap = self
-                        .session
-                        .context
-                        .snapshot(self.session.messages.len() as u32);
-                    let _ = tx.send(AgentEvent::ContextUsage(snap)).await;
-                    let _ = tx.send(AgentEvent::Done { usage }).await;
-                    return;
-                }
+                    oscar_core::FinishReason::Cancelled | oscar_core::FinishReason::Error
+                );
+
+            if !should_run_tools {
+                let snap = self
+                    .session
+                    .context
+                    .snapshot(self.session.messages.len() as u32);
+                let _ = tx.send(AgentEvent::ContextUsage(snap)).await;
+                let _ = tx.send(AgentEvent::Done { usage }).await;
+                return;
             }
 
-            if matches!(finish, oscar_core::FinishReason::ToolCalls) || !tool_calls.is_empty() {
-                self.handle_tool_calls(tool_calls, &tx, &cancel).await;
-                if self.pending_retry.is_some() {
-                    let snap = self
-                        .session
-                        .context
-                        .snapshot(self.session.messages.len() as u32);
-                    let _ = tx.send(AgentEvent::ContextUsage(snap)).await;
-                    let _ = tx.send(AgentEvent::Done { usage }).await;
-                    return;
-                }
-                rounds += 1;
-                if rounds >= self.options.max_tool_rounds {
-                    let _ = tx
-                        .send(AgentEvent::Error {
-                            message: "max tool rounds reached".into(),
-                        })
-                        .await;
-                    let _ = tx.send(AgentEvent::Done { usage }).await;
-                    return;
-                }
-                continue;
+            // Tool round — execute then continue the model loop.
+            self.handle_tool_calls(tool_calls, &tx, &cancel).await;
+            if self.pending_retry.is_some() {
+                let snap = self
+                    .session
+                    .context
+                    .snapshot(self.session.messages.len() as u32);
+                let _ = tx.send(AgentEvent::ContextUsage(snap)).await;
+                let _ = tx.send(AgentEvent::Done { usage }).await;
+                return;
             }
-
-            let snap = self
-                .session
-                .context
-                .snapshot(self.session.messages.len() as u32);
-            let _ = tx.send(AgentEvent::ContextUsage(snap)).await;
-            let _ = tx.send(AgentEvent::Done { usage }).await;
-            return;
+            rounds += 1;
+            if rounds >= self.options.max_tool_rounds {
+                let _ = tx
+                    .send(AgentEvent::Error {
+                        message: "max tool rounds reached".into(),
+                    })
+                    .await;
+                let _ = tx.send(AgentEvent::Done { usage }).await;
+                return;
+            }
+            continue;
         }
     }
 
@@ -794,16 +811,24 @@ impl Agent {
                         content,
                     ));
                 }
-                "tools_execute" => {
-                    let tool_id = tc
-                        .arguments
-                        .get("tool_id")
-                        .or_else(|| tc.arguments.get("id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    // Models sometimes nest args wrong or stringify JSON — normalize.
-                    let args = normalize_execute_arguments(&tc.arguments);
+                name if ToolRegistry::is_native_account_tool(name)
+                    || name == "tools_execute" =>
+                {
+                    // Native account tools are called by id; Code Mode uses tools_execute.
+                    let (tool_id, args) = if name == "tools_execute" {
+                        let tool_id = tc
+                            .arguments
+                            .get("tool_id")
+                            .or_else(|| tc.arguments.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let args = normalize_execute_arguments(&tc.arguments);
+                        (tool_id, args)
+                    } else {
+                        // Direct native call — arguments are the tool args object.
+                        (name.to_string(), normalize_execute_arguments(&tc.arguments))
+                    };
                     let redacted = redact_args(&args);
                     let _ = tx
                         .send(AgentEvent::ToolStart {
@@ -838,6 +863,14 @@ impl Agent {
                             Some(&self.session.id),
                             Some(&preview),
                         );
+                    }
+
+                    // After creating a playbook: rediscover skills and pin it into session context.
+                    if tool_id == "system.skills.create" && result.ok {
+                        if let Some(name) = result.data.get("name").and_then(|v| v.as_str()) {
+                            self.reload_skills();
+                            let _ = self.activate_skill(name);
+                        }
                     }
 
                     // Promote install approval from install_plan tool
@@ -924,6 +957,11 @@ impl Agent {
                         .and_then(|v| v.as_str())
                     {
                         self.set_preferred_profile(Some(pid.to_string()));
+                        let _ = tx
+                            .send(AgentEvent::ContentDelta {
+                                text: format!("\n[active profile: {pid}]\n"),
+                            })
+                            .await;
                     }
                     if result
                         .data
@@ -932,6 +970,11 @@ impl Agent {
                         .unwrap_or(false)
                     {
                         self.set_preferred_profile(None);
+                        let _ = tx
+                            .send(AgentEvent::ContentDelta {
+                                text: "\n[active profile: —]\n".into(),
+                            })
+                            .await;
                     }
 
                     if let Some(auth) = result.auth_required.clone() {
@@ -976,9 +1019,15 @@ impl Agent {
                     }
 
                     let content = model_safe_tool_payload(&result);
+                    // Tool result `name` must match the assistant tool call name.
+                    let result_name = if name == "tools_execute" {
+                        "tools_execute"
+                    } else {
+                        name
+                    };
                     self.session
                         .messages
-                        .push(Message::tool_result(tc.id, "tools_execute", content));
+                        .push(Message::tool_result(tc.id, result_name, content));
                 }
                 other => {
                     let msg = format!("unknown agent tool: {other}");
@@ -992,6 +1041,26 @@ impl Agent {
                         .push(Message::tool_result(tc.id, other, msg));
                 }
             }
+        }
+        // If the last assistant turn had no user-visible prose (tool-only), nudge narration.
+        // Avoid stacking: replace prior host narration nudges.
+        let needs_narration = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant)
+            .map(|m| m.content.trim().is_empty())
+            .unwrap_or(false);
+        self.session.messages.retain(|m| {
+            !(m.role == MessageRole::System
+                && m.content.starts_with("[host] Tool results ready"))
+        });
+        if needs_narration {
+            let nudge = String::from(
+                "[host] Tool results ready. Before more tools or finishing: write 1-2 short sentences to the user with findings, misses, or the next concrete step (include account/profile ids). Never leave a silent miss - say you could not find it.",
+            );
+            self.session.messages.push(Message::system(nudge));
         }
         self.session.context.observe_messages(&self.session.messages);
     }
@@ -1112,15 +1181,47 @@ impl Agent {
         let mut result = result;
         result.summary = format!("{} (retried_after_auth)", result.summary);
         let content = model_safe_tool_payload(&result);
+        // Match the original tool call name (native account tools vs tools_execute).
+        let result_name = if ToolRegistry::is_native_account_tool(&pending.tool_id) {
+            pending.tool_id.as_str()
+        } else {
+            "tools_execute"
+        };
         self.session.messages.push(Message::tool_result(
             pending.tool_call_id,
-            "tools_execute",
+            result_name,
             content,
         ));
-        self.session.messages.push(Message::user(format!(
-            "[system] Credentials were updated and tool `{}` was retried successfully (or finished). Continue the investigation using the latest tool results.",
-            pending.tool_id
+        // Strong continue: resume the user's original goal, narrate findings.
+        let original = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::User && !m.content.starts_with("[system]"))
+            .map(|m| m.content.clone())
+            .unwrap_or_else(|| "(continue prior user request)".into());
+        self.session.messages.push(Message::system(format!(
+            "[host] Auth succeeded and tool `{}` finished (ok={}). Resume the user's original request below. \
+             Run any remaining domain tools (DNS/zones/search) now, then answer in 1-2 sentences: found / not found / missing permissions. Do not stop silently.\n\
+             Original user request:\n{original}",
+            pending.tool_id, result.ok
         )));
+        let _ = tx
+            .send(AgentEvent::ContentDelta {
+                text: format!(
+                    "\n[auth ok — continuing: {}]\n",
+                    if original.chars().count() > 80 {
+                        format!(
+                            "{}…",
+                            original.chars().take(77).collect::<String>()
+                        )
+                    } else {
+                        original.clone()
+                    }
+                ),
+            })
+            .await;
 
         // Continue agent loop without another human prompt.
         self.run_turn_continue(tx, cancel).await;
@@ -1174,9 +1275,11 @@ impl Agent {
             let mut tool_calls: Vec<ToolCall> = Vec::new();
             let mut usage: Option<TokenUsage> = None;
             let mut finish = oscar_core::FinishReason::Stop;
+            let mut stream_error = false;
             tokio::pin!(stream);
             while let Some(ev) = stream.next().await {
                 if cancel.is_cancelled() {
+                    finish = oscar_core::FinishReason::Cancelled;
                     break;
                 }
                 match ev {
@@ -1198,6 +1301,7 @@ impl Agent {
                         finish = finish_reason;
                     }
                     ProviderStreamEvent::Error(e) => {
+                        stream_error = true;
                         let _ = tx.send(AgentEvent::Error { message: e }).await;
                     }
                 }
@@ -1208,6 +1312,16 @@ impl Agent {
                         chars: thinking.len(),
                     })
                     .await;
+            }
+            if !tool_calls.is_empty()
+                && !matches!(
+                    finish,
+                    oscar_core::FinishReason::ToolCalls
+                        | oscar_core::FinishReason::Cancelled
+                        | oscar_core::FinishReason::Error
+                )
+            {
+                finish = oscar_core::FinishReason::ToolCalls;
             }
             self.session.messages.push(Message {
                 role: MessageRole::Assistant,
@@ -1221,7 +1335,13 @@ impl Agent {
                 name: None,
                 tool_calls: tool_calls.clone(),
             });
-            if tool_calls.is_empty() {
+            let should_run_tools = !tool_calls.is_empty()
+                && !stream_error
+                && !matches!(
+                    finish,
+                    oscar_core::FinishReason::Cancelled | oscar_core::FinishReason::Error
+                );
+            if !should_run_tools {
                 let snap = self
                     .session
                     .context
@@ -1250,7 +1370,7 @@ impl Agent {
                 let _ = tx.send(AgentEvent::Done { usage }).await;
                 return;
             }
-            let _ = finish;
+            // Continue model loop after tools (next iteration of outer loop).
         }
     }
 

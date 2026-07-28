@@ -24,12 +24,13 @@ pub use chat_history::{
     SessionSummary, StoredChatSession, TranscriptLine,
 };
 pub use config::{
-    InstallBinariesPolicy, McpServerConfig, McpSettings, OscarConfig, Paths, SkillsSettings,
-    ToolsSettings,
+    AuthSettings, CatalogSettings, InstallBinariesPolicy, McpServerConfig, McpSettings,
+    OscarConfig, Paths, SkillsSettings, ToolsSettings,
 };
 pub use mcp_config::{expand_env_string, infer_mcp_capability, mcp_tool_id};
 pub use skills::{
-    discover_skills, find_skill, skills_catalog_prompt, user_skills_dir, Skill,
+    discover_skills, find_skill, render_skill_md, search_skills, skills_catalog_prompt,
+    user_skills_dir, write_skill, Skill, SkillScope,
 };
 pub use discovery::{
     best_field_match, match_ip_or_cidr, match_text, DiscoveryHit, DiscoveryResult, MatchMode,

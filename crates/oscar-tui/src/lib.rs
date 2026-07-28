@@ -8,12 +8,14 @@ mod clipboard;
 mod identities;
 mod input;
 mod provider_pane;
+mod sessions_pane;
 mod settings;
+mod slash;
 mod ui;
 
 pub use app::{
-    run_tui, AgentActivity, App, AppConfig, PaneFocus, SessionAction, View, MAX_SCROLL_BACK_LINES,
-    MAX_TRANSCRIPT_LINES,
+    run_tui, AgentActivity, App, AppConfig, PaneFocus, SessionAction, TuiExit, View,
+    MAX_SCROLL_BACK_ROWS, MAX_TRANSCRIPT_LINES,
 };
 pub use clipboard::{copy_text, paste_text, CopyOutcome};
 pub use identities::IdentitiesPane;

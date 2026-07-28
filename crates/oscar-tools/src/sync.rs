@@ -147,7 +147,7 @@ pub async fn run_json_command_with_env(
 }
 
 pub async fn which_ok(program: &str) -> bool {
-    Command::new(program)
+    if Command::new(program)
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -155,6 +155,102 @@ pub async fn which_ok(program: &str) -> bool {
         .await
         .map(|s| s.success())
         .unwrap_or(false)
+    {
+        return true;
+    }
+    // Some CLIs (ping, ss, ip) don't always accept --version.
+    command_on_path(program).await
+}
+
+/// True if `program` resolves on PATH (via `command -v`).
+pub async fn command_on_path(program: &str) -> bool {
+    let check = format!("command -v {program}");
+    Command::new("sh")
+        .args(["-c", &check])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Run a host CLI and return stdout+stderr text (capped). Times out after `timeout_sec`.
+pub async fn run_text_command(
+    program: &str,
+    args: &[&str],
+    timeout_sec: u64,
+) -> OscarResult<String> {
+    run_text_command_with_env(program, args, &[], timeout_sec).await
+}
+
+pub async fn run_text_command_with_env(
+    program: &str,
+    args: &[&str],
+    env: &[(String, String)],
+    timeout_sec: u64,
+) -> OscarResult<String> {
+    let timeout_sec = timeout_sec.clamp(1, 120);
+    debug!(program, ?args, timeout_sec, "run_text_command");
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let child = cmd.spawn().map_err(|e| {
+        OscarError::Tool(format!(
+            "failed to spawn `{program}`: {e}. Is it installed and on PATH?"
+        ))
+    })?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_sec),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| {
+        OscarError::Tool(format!(
+            "`{program}` timed out after {timeout_sec}s (args: {})",
+            args.join(" ")
+        ))
+    })?
+    .map_err(|e| OscarError::Tool(format!("`{program}` wait failed: {e}")))?;
+
+    let mut text = String::new();
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    if !out.is_empty() {
+        text.push_str(&out);
+    }
+    if !err.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&err);
+    }
+    // Cap agent-facing payload
+    const MAX: usize = 48_000;
+    if text.len() > MAX {
+        text.truncate(MAX);
+        text.push_str("\n… [truncated]");
+    }
+    if !output.status.success() && text.trim().is_empty() {
+        return Err(OscarError::Tool(format!(
+            "`{program} {}` failed ({})",
+            args.join(" "),
+            output.status
+        )));
+    }
+    if !output.status.success() {
+        // Still return stdout/stderr so agent can read errors (ping unreachable, etc.)
+        return Ok(format!(
+            "[exit {}]\n{}",
+            output.status.code().unwrap_or(-1),
+            text
+        ));
+    }
+    Ok(text)
 }
 
 /// AWS profile flag / env for CLI (uses oscar profile label or account as AWS_PROFILE hint).
@@ -180,6 +276,9 @@ pub fn gcloud_project_args(profile: &Profile) -> Vec<String> {
 }
 
 /// Load DNS inventory: cache first; if missing/stale and source provided, live sync.
+///
+/// Cache with zones but **zero records** is treated as incomplete (e.g. after a
+/// zones-only list wrote metadata) so pattern search re-syncs instead of false empty.
 pub async fn ensure_dns_inventory(
     config_dir: &Path,
     profile: &Profile,
@@ -188,8 +287,22 @@ pub async fn ensure_dns_inventory(
     force: bool,
 ) -> OscarResult<DnsInventory> {
     if !force {
-        if let Some(inv) = crate::inventory::load_json(&dns_cache_path(config_dir, &profile.id)) {
-            return Ok(inv);
+        if let Some(inv) = crate::inventory::load_json::<DnsInventory>(&dns_cache_path(
+            config_dir,
+            &profile.id,
+        )) {
+            let record_n: usize = inv.zones.iter().map(|z| z.records.len()).sum();
+            let incomplete = inv.zones.is_empty()
+                || (opts.include_records && !inv.zones.is_empty() && record_n == 0);
+            if !incomplete {
+                return Ok(inv);
+            }
+            debug!(
+                profile = %profile.id,
+                zones = inv.zones.len(),
+                records = record_n,
+                "DNS cache incomplete — live re-sync"
+            );
         }
     }
     let inv = source.sync_dns(profile, opts).await?;

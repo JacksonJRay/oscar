@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct McpServerStatus {
@@ -45,7 +45,7 @@ impl McpManager {
         self.clients.clear();
         self.tools.clear();
         if !self.settings.enabled {
-            info!("mcp master switch disabled");
+            debug!("mcp master switch disabled");
             return;
         }
         let servers: Vec<(String, McpServerConfig)> = self
@@ -84,7 +84,7 @@ impl McpManager {
                 Ok(Ok((client, tools))) => {
                     let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
                     let count = tools.len();
-                    info!(server = %name, count, "mcp tools listed");
+                    debug!(server = %name, count, "mcp tools listed");
                     self.tools.insert(name.clone(), tools);
                     self.clients
                         .insert(name.clone(), Arc::new(Mutex::new(client)));

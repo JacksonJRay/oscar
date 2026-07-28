@@ -800,13 +800,13 @@ impl Tool for AwsIamPatternSearch {
             meta!(
                 "aws.iam.pattern.search",
                 "Search IAM users/roles/groups/policies by name",
-                "High-accuracy discovery for IAM entities by name fragment or glob. kinds: user|role|group|policy|all.",
+                "Partial-match discovery for IAM entities (substring contains by default; simple glob with *). kinds: user|role|group|policy.",
                 Capability::Read,
-                ["iam", "pattern", "search", "user", "role", "group", "policy", "discover"],
+                ["iam", "pattern", "search", "user", "role", "group", "policy", "discover", "partial"],
                 json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string" },
+                        "pattern": { "type": "string", "description": "Name fragment (partial contains) or simple glob (*)" },
                         "kinds": {
                             "type": "array",
                             "items": { "type": "string", "enum": ["user", "role", "group", "policy"] }

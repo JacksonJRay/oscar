@@ -360,13 +360,13 @@ impl Tool for AzureIamRoleDefinitionsList {
             meta!(
                 "azure.iam.role_definitions.list",
                 "List Azure role definitions",
-                "List built-in/custom RBAC roles; optional name filter.",
+                "List built-in/custom RBAC roles; optional partial name filter (substring/glob, not exact-only).",
                 Capability::Read,
-                ["iam", "rbac", "role", "definition", "list", "permission"],
+                ["iam", "rbac", "role", "definition", "list", "permission", "partial", "search"],
                 json!({
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "Filter by role name" },
+                        "name": { "type": "string", "description": "Partial role name fragment (case-insensitive contains/glob)" },
                         "scope": { "type": "string" },
                         "profile_id": { "type": "string" },
                         "limit": { "type": "integer", "default": 50 }
@@ -380,6 +380,7 @@ impl Tool for AzureIamRoleDefinitionsList {
             Ok(p) => p,
             Err(e) => return e,
         };
+        // Never pass --name to az (exact match only). List then filter partial client-side.
         let mut cli: Vec<String> = vec![
             "role".into(),
             "definition".into(),
@@ -387,34 +388,42 @@ impl Tool for AzureIamRoleDefinitionsList {
             "--output".into(),
             "json".into(),
         ];
-        if let Some(n) = args.get("name").and_then(|v| v.as_str()) {
-            cli.push("--name".into());
-            cli.push(n.into());
-        }
         if let Some(s) = args.get("scope").and_then(|v| v.as_str()) {
             cli.push("--scope".into());
             cli.push(s.into());
         }
+        let name_filter = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
         let refs: Vec<&str> = cli.iter().map(|s| s.as_str()).collect();
         match az_json(&refs).await {
             Ok(v) => {
                 let mut entities = Vec::new();
                 if let Some(arr) = v.as_array() {
-                    for r in arr.iter().take(limit) {
+                    for r in arr {
                         let name = r
                             .get("roleName")
                             .and_then(|x| x.as_str())
                             .unwrap_or("")
                             .to_string();
+                        let id = r.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                        let desc = r
+                            .get("description")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("");
+                        if let Some(ref nf) = name_filter {
+                            let hay = format!("{name} {id} {desc}");
+                            if !name_matches_partial(&hay, nf) {
+                                continue;
+                            }
+                        }
                         entities.push(AccessEntity {
                             cloud: Cloud::Azure,
                             kind: AccessObjectKind::Role,
-                            id: r
-                                .get("id")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("")
-                                .into(),
+                            id: id.into(),
                             name,
                             profile_id: None,
                             account_ref: None,
@@ -428,11 +437,20 @@ impl Tool for AzureIamRoleDefinitionsList {
                                 .map(|s| s.into()),
                             raw: Some(r.clone()),
                         });
+                        if entities.len() >= limit {
+                            break;
+                        }
                     }
                 }
                 ToolResult::success(
                     format!("{} role definition(s)", entities.len()),
-                    json!({ "cloud": "azure", "kind": "role", "entities": entities }),
+                    json!({
+                        "cloud": "azure",
+                        "kind": "role",
+                        "entities": entities,
+                        "name_filter": name_filter,
+                        "match": "partial",
+                    }),
                 )
             }
             Err(e) => e,
@@ -523,6 +541,53 @@ impl Tool for AzureIamUsersList {
     }
 }
 
+/// Case-insensitive partial / simple-glob match for name discovery.
+fn name_matches_partial(haystack: &str, pattern: &str) -> bool {
+    let n = haystack.to_ascii_lowercase();
+    let p = pattern.to_ascii_lowercase();
+    if p.is_empty() {
+        return true;
+    }
+    if p.contains('*') {
+        let parts: Vec<&str> = p.split('*').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return true;
+        }
+        let mut rest = n.as_str();
+        for (i, part) in parts.iter().enumerate() {
+            if let Some(idx) = rest.find(part) {
+                if i == 0 && !p.starts_with('*') && idx != 0 {
+                    return false;
+                }
+                rest = &rest[idx + part.len()..];
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+    n.contains(&p)
+}
+
+#[cfg(test)]
+mod partial_match_tests {
+    use super::name_matches_partial;
+
+    #[test]
+    fn partial_mid_string() {
+        assert!(name_matches_partial("Alice Contoso Admin", "contoso"));
+        assert!(name_matches_partial("alice@contoso.com", "contoso"));
+        assert!(!name_matches_partial("Alice Contoso", "fabrikam"));
+    }
+
+    #[test]
+    fn partial_glob() {
+        assert!(name_matches_partial("Reader", "Read*"));
+        assert!(name_matches_partial("Virtual Machine Contributor", "*Contributor"));
+        assert!(!name_matches_partial("Owner", "Read*"));
+    }
+}
+
 #[async_trait]
 impl Tool for AzureIamPrincipalsSearch {
     fn meta(&self) -> &ToolMeta {
@@ -531,13 +596,13 @@ impl Tool for AzureIamPrincipalsSearch {
             meta!(
                 "azure.iam.principals.search",
                 "Search Entra principals (users/SPs)",
-                "Search users and service principals by display name fragment.",
+                "Partial-match search for users and service principals (substring/glob on displayName, UPN, mail, appId). Prefer this over startswith-only filters.",
                 Capability::Read,
-                ["iam", "user", "service-principal", "search", "pattern", "entra"],
+                ["iam", "user", "service-principal", "search", "pattern", "entra", "partial"],
                 json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string" },
+                        "pattern": { "type": "string", "description": "Name fragment (partial contains) or simple glob (*)" },
                         "profile_id": { "type": "string" },
                         "limit": { "type": "integer", "default": 30 }
                     },
@@ -548,19 +613,77 @@ impl Tool for AzureIamPrincipalsSearch {
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult {
         let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return ToolResult::error("missing pattern"),
+            Some(s) if !s.trim().is_empty() => s.trim(),
+            _ => return ToolResult::error("missing pattern"),
         };
-        // Escape single quotes for OData
-        let safe = pattern.replace('\'', "''");
-        let filter = format!("startswith(displayName,'{safe}')");
-        let mut user_args = args.clone();
-        if let Some(obj) = user_args.as_object_mut() {
-            obj.insert("filter".into(), json!(filter));
+        let _p = match profile_or_auth(ctx, args.get("profile_id").and_then(|v| v.as_str())) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(30) as usize;
+        let mut entities = Vec::new();
+        let mut notes = Vec::new();
+
+        // List users broadly, then client-side partial match (startswith OData misses mid-string names).
+        match az_json(&["ad", "user", "list", "--output", "json"]).await {
+            Ok(v) => {
+                if let Some(arr) = v.as_array() {
+                    let scanned = arr.len();
+                    for u in arr {
+                        let display = u
+                            .get("displayName")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("");
+                        let upn = u
+                            .get("userPrincipalName")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("");
+                        let mail = u.get("mail").and_then(|x| x.as_str()).unwrap_or("");
+                        let id = u.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                        let hay = format!("{display} {upn} {mail} {id}");
+                        if !name_matches_partial(&hay, pattern) {
+                            continue;
+                        }
+                        entities.push(AccessEntity {
+                            cloud: Cloud::Azure,
+                            kind: AccessObjectKind::User,
+                            id: id.into(),
+                            name: if !upn.is_empty() {
+                                upn.into()
+                            } else {
+                                display.into()
+                            },
+                            profile_id: None,
+                            account_ref: None,
+                            path: None,
+                            attached_policies: vec![],
+                            groups: vec![],
+                            tags: vec![],
+                            description: if display.is_empty() {
+                                None
+                            } else {
+                                Some(display.into())
+                            },
+                            raw: Some(u.clone()),
+                        });
+                        if entities.len() >= limit {
+                            break;
+                        }
+                    }
+                    if scanned >= 100 && entities.is_empty() {
+                        notes.push(
+                            "Scanned directory page with 0 partial hits; large tenants may need a more specific pattern or Graph search."
+                                .into(),
+                        );
+                    }
+                }
+            }
+            Err(e) => notes.push(format!("users: {}", e.summary)),
         }
-        let users = AzureIamUsersList.execute(user_args, ctx).await;
-        // SP search
-        let sp = az_json(&[
+
+        // Service principals: try display-name filter first, then client-side partial.
+        let mut sp_rows: Vec<Value> = Vec::new();
+        match az_json(&[
             "ad",
             "sp",
             "list",
@@ -569,51 +692,77 @@ impl Tool for AzureIamPrincipalsSearch {
             "--output",
             "json",
         ])
-        .await;
-        let mut entities = Vec::new();
-        if users.ok {
-            if let Some(arr) = users.data.get("entities").and_then(|e| e.as_array()) {
-                for e in arr {
-                    if let Ok(ent) = serde_json::from_value::<AccessEntity>(e.clone()) {
-                        entities.push(ent);
+        .await
+        {
+            Ok(v) => {
+                if let Some(arr) = v.as_array() {
+                    sp_rows.extend(arr.iter().cloned());
+                }
+            }
+            Err(e) => notes.push(format!("sp display-name: {}", e.summary)),
+        }
+        // Also list a broader page when display-name returned nothing (prefix-only providers).
+        if sp_rows.is_empty() {
+            match az_json(&["ad", "sp", "list", "--output", "json"]).await {
+                Ok(v) => {
+                    if let Some(arr) = v.as_array() {
+                        sp_rows.extend(arr.iter().cloned());
                     }
                 }
+                Err(e) => notes.push(format!("sp list: {}", e.summary)),
             }
         }
-        if let Ok(v) = sp {
-            if let Some(arr) = v.as_array() {
-                for s in arr {
-                    entities.push(AccessEntity {
-                        cloud: Cloud::Azure,
-                        kind: AccessObjectKind::ServicePrincipal,
-                        id: s
-                            .get("id")
-                            .and_then(|x| x.as_str())
-                            .or_else(|| s.get("appId").and_then(|x| x.as_str()))
-                            .unwrap_or("")
-                            .into(),
-                        name: s
-                            .get("displayName")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .into(),
-                        profile_id: None,
-                        account_ref: None,
-                        path: None,
-                        attached_policies: vec![],
-                        groups: vec![],
-                        tags: vec![],
-                        description: None,
-                        raw: Some(s.clone()),
-                    });
-                }
+        for s in sp_rows {
+            if entities.len() >= limit {
+                break;
             }
+            let display = s
+                .get("displayName")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let app_id = s.get("appId").and_then(|x| x.as_str()).unwrap_or("");
+            let id = s
+                .get("id")
+                .and_then(|x| x.as_str())
+                .or(Some(app_id))
+                .unwrap_or("");
+            let hay = format!("{display} {app_id} {id}");
+            if !name_matches_partial(&hay, pattern) {
+                continue;
+            }
+            // De-dupe by id
+            if entities.iter().any(|e| e.id == id) {
+                continue;
+            }
+            entities.push(AccessEntity {
+                cloud: Cloud::Azure,
+                kind: AccessObjectKind::ServicePrincipal,
+                id: id.into(),
+                name: display.into(),
+                profile_id: None,
+                account_ref: None,
+                path: None,
+                attached_policies: vec![],
+                groups: vec![],
+                tags: vec![],
+                description: None,
+                raw: Some(s),
+            });
         }
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(30) as usize;
+
         entities.truncate(limit);
         ToolResult::success(
-            format!("{} principal(s) matching `{pattern}`", entities.len()),
-            json!({ "cloud": "azure", "pattern": pattern, "entities": entities }),
+            format!(
+                "{} principal(s) partial-matching `{pattern}`",
+                entities.len()
+            ),
+            json!({
+                "cloud": "azure",
+                "pattern": pattern,
+                "match": "partial",
+                "entities": entities,
+                "notes": notes,
+            }),
         )
     }
 }
@@ -689,13 +838,13 @@ impl Tool for AzureIamPatternSearch {
             meta!(
                 "azure.iam.pattern.search",
                 "Search Azure IAM users/roles/assignments",
-                "Combined search across principals and role assignment names.",
+                "Partial-match search across principals (displayName/UPN), role definition names, and role assignment fields. Prefer fragments over exact names.",
                 Capability::Read,
-                ["iam", "pattern", "search", "rbac", "user", "role", "discover"],
+                ["iam", "pattern", "search", "rbac", "user", "role", "discover", "partial"],
                 json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string" },
+                        "pattern": { "type": "string", "description": "Name fragment (partial contains) or simple glob" },
                         "profile_id": { "type": "string" },
                         "limit": { "type": "integer", "default": 40 }
                     },

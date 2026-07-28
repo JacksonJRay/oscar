@@ -758,13 +758,13 @@ impl Tool for GcpIamPatternSearch {
             meta!(
                 "gcp.iam.pattern.search",
                 "Search service accounts and IAM members by pattern",
-                "Search SA emails and project IAM binding members by name fragment.",
+                "Partial-match search for SA emails and project IAM binding members (substring contains). Prefer name fragments over full emails.",
                 Capability::Read,
-                ["iam", "pattern", "search", "service-account", "binding", "discover"],
+                ["iam", "pattern", "search", "service-account", "binding", "discover", "partial"],
                 json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string" },
+                        "pattern": { "type": "string", "description": "Name fragment (partial contains)" },
                         "project": { "type": "string" },
                         "profile_id": { "type": "string" },
                         "limit": { "type": "integer", "default": 50 }

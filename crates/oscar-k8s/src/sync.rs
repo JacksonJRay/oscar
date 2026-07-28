@@ -10,6 +10,20 @@ use std::path::Path;
 
 pub struct KubectlK8sSource {
     pub context: Option<String>,
+    /// Oscar-managed kubeconfig path (isolated per cluster).
+    pub kubeconfig: Option<String>,
+    /// Extra env for exec plugins (e.g. AWS short-lived keys for EKS).
+    pub env: Vec<(String, String)>,
+}
+
+impl Default for KubectlK8sSource {
+    fn default() -> Self {
+        Self {
+            context: None,
+            kubeconfig: None,
+            env: vec![],
+        }
+    }
 }
 
 #[async_trait]
@@ -23,6 +37,11 @@ impl K8sInventorySource for KubectlK8sSource {
         let ctx = context
             .map(|s| s.to_string())
             .or_else(|| self.context.clone());
+
+        let mut env = self.env.clone();
+        if let Some(ref kc) = self.kubeconfig {
+            env.push(("KUBECONFIG".into(), kc.clone()));
+        }
 
         let mut pods_args = vec!["get".into(), "pods".into(), "-A".into(), "-o".into(), "json".into()];
         let mut svc_args = vec![
@@ -46,25 +65,77 @@ impl K8sInventorySource for KubectlK8sSource {
             }
         }
 
-        let pods = run_json_args(&pods_args).await?;
-        let svcs = run_json_args(&svc_args).await.ok();
-        let nodes = run_json_args(&node_args).await.ok();
-        let namespaces = run_json_args(&ns_args).await.ok();
+        let pods = run_json_args(&pods_args, &env).await?;
+        let svcs = run_json_args(&svc_args, &env).await.ok();
+        let nodes = run_json_args(&node_args, &env).await.ok();
+        let namespaces = run_json_args(&ns_args, &env).await.ok();
 
-        Ok(map_kubectl_to_k8s_inventory(
+        // Best-effort extra kinds for narrow pattern tools
+        let mut deploy_args = vec![
+            "get".into(),
+            "deploy".into(),
+            "-A".into(),
+            "-o".into(),
+            "json".into(),
+        ];
+        let mut ing_args = vec![
+            "get".into(),
+            "ingress".into(),
+            "-A".into(),
+            "-o".into(),
+            "json".into(),
+        ];
+        let mut np_args = vec![
+            "get".into(),
+            "networkpolicy".into(),
+            "-A".into(),
+            "-o".into(),
+            "json".into(),
+        ];
+        let mut eps_args = vec![
+            "get".into(),
+            "endpointslices".into(),
+            "-A".into(),
+            "-o".into(),
+            "json".into(),
+        ];
+        if let Some(ref c) = ctx {
+            for a in [
+                &mut deploy_args,
+                &mut ing_args,
+                &mut np_args,
+                &mut eps_args,
+            ] {
+                a.insert(0, "--context".into());
+                a.insert(1, c.clone());
+            }
+        }
+        let deploys = run_json_args(&deploy_args, &env).await.ok();
+        let ingress = run_json_args(&ing_args, &env).await.ok();
+        let netpols = run_json_args(&np_args, &env).await.ok();
+        let eps = run_json_args(&eps_args, &env).await.ok();
+
+        Ok(map_kubectl_to_k8s_inventory_full(
             ctx.as_deref(),
             None,
             &pods,
             svcs.as_ref(),
             nodes.as_ref(),
             namespaces.as_ref(),
+            deploys.as_ref(),
+            ingress.as_ref(),
+            netpols.as_ref(),
+            eps.as_ref(),
         ))
     }
 }
 
-async fn run_json_args(args: &[String]) -> OscarResult<serde_json::Value> {
+async fn run_json_args(
+    args: &[String],
+    env: &[(String, String)],
+) -> OscarResult<serde_json::Value> {
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run_json_command("kubectl", &refs).await
+    oscar_tools::sync::run_json_command_with_env("kubectl", &refs, env).await
 }
 
 pub fn map_kubectl_to_k8s_inventory(
@@ -74,6 +145,32 @@ pub fn map_kubectl_to_k8s_inventory(
     svcs: Option<&serde_json::Value>,
     nodes: Option<&serde_json::Value>,
     namespaces: Option<&serde_json::Value>,
+) -> K8sInventory {
+    map_kubectl_to_k8s_inventory_full(
+        context,
+        profile_id,
+        pods,
+        svcs,
+        nodes,
+        namespaces,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+pub fn map_kubectl_to_k8s_inventory_full(
+    context: Option<&str>,
+    profile_id: Option<&str>,
+    pods: &serde_json::Value,
+    svcs: Option<&serde_json::Value>,
+    nodes: Option<&serde_json::Value>,
+    namespaces: Option<&serde_json::Value>,
+    deploys: Option<&serde_json::Value>,
+    ingress: Option<&serde_json::Value>,
+    netpols: Option<&serde_json::Value>,
+    endpointslices: Option<&serde_json::Value>,
 ) -> K8sInventory {
     let mut resources = Vec::new();
 
@@ -223,10 +320,101 @@ pub fn map_kubectl_to_k8s_inventory(
         }
     }
 
+    push_named_kind(&mut resources, deploys, "Deployment");
+    push_named_kind(&mut resources, ingress, "Ingress");
+    push_named_kind(&mut resources, netpols, "NetworkPolicy");
+
+    if let Some(items) = endpointslices
+        .and_then(|v| v.get("items"))
+        .and_then(|v| v.as_array())
+    {
+        for e in items {
+            let name = e
+                .pointer("/metadata/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let ns = e
+                .pointer("/metadata/namespace")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let mut ips = Vec::new();
+            if let Some(ends) = e.get("endpoints").and_then(|v| v.as_array()) {
+                for ep in ends {
+                    if let Some(addrs) = ep.get("addresses").and_then(|v| v.as_array()) {
+                        for a in addrs {
+                            if let Some(ip) = a.as_str() {
+                                ips.push(ip.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            let mut extra = Vec::new();
+            if let Some(svc) = e
+                .pointer("/metadata/labels/kubernetes.io/service-name")
+                .and_then(|v| v.as_str())
+            {
+                extra.push(format!("service={svc}"));
+            }
+            if name.is_empty() {
+                continue;
+            }
+            resources.push(K8sResourceEntry {
+                kind: "EndpointSlice".into(),
+                name,
+                namespace: ns,
+                labels: vec![],
+                ips,
+                extra,
+            });
+        }
+    }
+
     K8sInventory {
         context: context.map(|s| s.to_string()),
         profile_id: profile_id.map(|s| s.to_string()),
         resources,
+    }
+}
+
+fn push_named_kind(
+    resources: &mut Vec<K8sResourceEntry>,
+    blob: Option<&serde_json::Value>,
+    kind: &str,
+) {
+    let Some(items) = blob.and_then(|v| v.get("items")).and_then(|v| v.as_array()) else {
+        return;
+    };
+    for it in items {
+        let name = it
+            .pointer("/metadata/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ns = it
+            .pointer("/metadata/namespace")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if name.is_empty() {
+            continue;
+        }
+        let mut labels = Vec::new();
+        if let Some(obj) = it.pointer("/metadata/labels").and_then(|v| v.as_object()) {
+            for (k, v) in obj.iter().take(12) {
+                if let Some(vs) = v.as_str() {
+                    labels.push(format!("{k}={vs}"));
+                }
+            }
+        }
+        resources.push(K8sResourceEntry {
+            kind: kind.into(),
+            name,
+            namespace: ns,
+            labels,
+            ips: vec![],
+            extra: vec![],
+        });
     }
 }
 
@@ -278,6 +466,12 @@ pub fn k8s_inventory_to_network(inv: &K8sInventory) -> NetworkInventory {
         vpcs: vec![],
         subnets: vec![],
         addresses,
+        security_groups: vec![],
+        nacls: vec![],
+        route_tables: vec![],
+        routes: vec![],
+        functions: vec![],
+        services: vec![],
     }
 }
 
@@ -288,8 +482,21 @@ pub async fn sync_and_cache(
     context: Option<&str>,
     profile_id: Option<&str>,
 ) -> OscarResult<K8sInventory> {
+    sync_and_cache_with_opts(config_dir, context, profile_id, None, vec![]).await
+}
+
+/// Like [`sync_and_cache`] but sets `KUBECONFIG` and optional CSP env (EKS STS).
+pub async fn sync_and_cache_with_opts(
+    config_dir: &Path,
+    context: Option<&str>,
+    profile_id: Option<&str>,
+    kubeconfig: Option<&str>,
+    env: Vec<(String, String)>,
+) -> OscarResult<K8sInventory> {
     let source = KubectlK8sSource {
         context: context.map(|s| s.to_string()),
+        kubeconfig: kubeconfig.map(|s| s.to_string()),
+        env,
     };
     let mut inv = source.sync_k8s(context).await?;
     inv.profile_id = profile_id.map(|s| s.to_string());

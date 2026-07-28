@@ -8,6 +8,7 @@ description = "Ratatui chat interface for oscar"
 [dependencies]
 oscar-core.workspace = true
 oscar-identity.workspace = true
+oscar-providers.workspace = true
 arboard.workspace = true
 crossterm.workspace = true
 dirs.workspace = true

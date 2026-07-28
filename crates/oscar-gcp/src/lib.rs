@@ -1,6 +1,7 @@
 //! GCP tools: Cloud DNS + network inventory + Connectivity Tests + IAM + pattern discovery.
 
 mod iam;
+mod network_write;
 mod resolver;
 mod sync_dns;
 mod sync_network;
@@ -32,8 +33,21 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register(Arc::new(GcpConnectivityTest));
     registry.register(Arc::new(GcpNetworkPatternSearch));
     registry.register(Arc::new(GcpNetworkSubnetPattern));
+    registry.register(Arc::new(GcpNetworkVpcPattern));
+    registry.register(Arc::new(GcpNetworkFirewallPattern));
+    registry.register(Arc::new(GcpNetworkRoutePattern));
+    registry.register(Arc::new(GcpNetworkRouteTablePattern));
+    registry.register(Arc::new(GcpComputeFunctionPattern));
+    registry.register(Arc::new(GcpNetworkPeeringPattern));
+    registry.register(Arc::new(GcpNetworkVpnPattern));
+    registry.register(Arc::new(GcpNetworkHybridPattern));
+    registry.register(Arc::new(GcpNetworkNatPattern));
+    registry.register(Arc::new(GcpNetworkSharePattern));
+    registry.register(Arc::new(GcpNetworkServicePattern));
     registry.register(Arc::new(GcpNetworkIpLocate));
     registry.register(Arc::new(GcpNetworkInventorySync));
+    // Network write (create/delete) — Capability::Write, mode-gated
+    network_write::register_network_write(registry);
     // Track C — DNS policies / forwarding / response policies
     registry.register(Arc::new(resolver::GcpDnsResolverInventorySync));
     registry.register(Arc::new(resolver::GcpDnsPolicyPatternSearch));
@@ -48,6 +62,17 @@ struct GcpDnsPatternSearch;
 struct GcpDnsInventorySync;
 struct GcpDnsRecordCreate;
 struct GcpDnsRecordDelete;
+struct GcpNetworkVpcPattern;
+struct GcpNetworkFirewallPattern;
+struct GcpNetworkRoutePattern;
+struct GcpNetworkRouteTablePattern;
+struct GcpComputeFunctionPattern;
+struct GcpNetworkPeeringPattern;
+struct GcpNetworkVpnPattern;
+struct GcpNetworkHybridPattern;
+struct GcpNetworkNatPattern;
+struct GcpNetworkSharePattern;
+struct GcpNetworkServicePattern;
 struct GcpConnectivityTest;
 struct GcpNetworkPatternSearch;
 struct GcpNetworkSubnetPattern;
@@ -109,16 +134,22 @@ impl Tool for GcpDnsRecordLookup {
         static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
         META.get_or_init(|| ToolMeta {
             id: "gcp.dns.record.lookup".into(),
-            name: "Lookup Cloud DNS record".into(),
-            description: "Record lookup; use gcp.dns.pattern.search for partial/glob discovery.".into(),
+            name: "Lookup Cloud DNS record (partial)".into(),
+            description: "Find Cloud DNS records by name fragment (partial match by default). Delegates to gcp.dns.pattern.search.".into(),
             domain: ToolDomain::Dns,
             clouds: vec![Cloud::Gcp],
             capability: Capability::Read,
-            tags: vec!["dns".into(), "record".into(), "lookup".into()],
+            tags: vec![
+                "dns".into(),
+                "record".into(),
+                "lookup".into(),
+                "partial".into(),
+                "search".into(),
+            ],
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string" },
+                    "name": { "type": "string", "description": "Record name or partial fragment" },
                     "type": { "type": "string" },
                     "profile_id": { "type": "string" }
                 },
@@ -136,6 +167,7 @@ impl Tool for GcpDnsRecordLookup {
         let mut a = args.clone();
         if let Some(obj) = a.as_object_mut() {
             obj.insert("pattern".into(), json!(name));
+            obj.insert("mode".into(), json!("partial"));
         }
         GcpDnsPatternSearch.execute(a, ctx).await
     }
@@ -541,7 +573,16 @@ impl Tool for GcpConnectivityTest {
             domain: ToolDomain::Network,
             clouds: vec![Cloud::Gcp],
             capability: Capability::Read,
-            tags: vec!["network".into(), "path".into(), "connectivity".into()],
+            tags: vec![
+                "network".into(),
+                "path".into(),
+                "connectivity".into(),
+                "connectivity-test".into(),
+                "status".into(),
+                "analyze".into(),
+                "troubleshoot".into(),
+                "reachability".into(),
+            ],
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -658,7 +699,11 @@ fn uuid_like() -> String {
     format!("{t:x}")
 }
 
-async fn gcp_net_pattern(args: serde_json::Value, ctx: &ToolContext, only_subnet: bool) -> ToolResult {
+async fn gcp_net_pattern(
+    args: serde_json::Value,
+    ctx: &ToolContext,
+    kinds_filter: Option<&[&str]>,
+) -> ToolResult {
     let q = match PatternQuery::from_args(&args) {
         Ok(q) => q,
         Err(e) => return ToolResult::error(e),
@@ -692,8 +737,11 @@ async fn gcp_net_pattern(args: serde_json::Value, ctx: &ToolContext, only_subnet
         {
             Ok(inv) => {
                 let mut part = scan_network_inventory(&inv, &q);
-                if only_subnet {
-                    part.hits.retain(|h| h.kind.to_string() == "subnet");
+                if let Some(filters) = kinds_filter {
+                    part.hits.retain(|h| {
+                        let k = h.kind.to_string();
+                        filters.iter().any(|f| k == *f)
+                    });
                 }
                 merged.hits.append(&mut part.hits);
             }
@@ -702,8 +750,11 @@ async fn gcp_net_pattern(args: serde_json::Value, ctx: &ToolContext, only_subnet
                 merged.notes.push(format!("profile `{}`: {e}", p.id));
                 if let Some(inv) = load_network_cache(&ctx.config_dir, &p.id, q.region.as_deref()) {
                     let mut part = scan_network_inventory(&inv, &q);
-                    if only_subnet {
-                        part.hits.retain(|h| h.kind.to_string() == "subnet");
+                    if let Some(filters) = kinds_filter {
+                        part.hits.retain(|h| {
+                            let k = h.kind.to_string();
+                            filters.iter().any(|f| k == *f)
+                        });
                     }
                     merged.hits.append(&mut part.hits);
                 }
@@ -720,8 +771,8 @@ impl Tool for GcpNetworkInventorySync {
         static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
         META.get_or_init(|| ToolMeta {
             id: "gcp.network.inventory.sync".into(),
-            name: "Sync VPC/subnet/IP into unified NetworkInventory".into(),
-            description: "Live-fetch GCP VPC networks, subnets, addresses, and instance IPs via gcloud; map to unified NetworkInventory cache for pattern search.".into(),
+            name: "Sync VPC/firewall/routes/functions into NetworkInventory".into(),
+            description: "Live-fetch GCP VPC networks, subnets, addresses, firewall rules, routes, Cloud Functions, and Cloud Run via gcloud; map to unified NetworkInventory cache for pattern search.".into(),
             domain: ToolDomain::Network,
             clouds: vec![Cloud::Gcp],
             capability: Capability::Read,
@@ -731,6 +782,9 @@ impl Tool for GcpNetworkInventorySync {
                 "inventory".into(),
                 "vpc".into(),
                 "subnet".into(),
+                "firewall".into(),
+                "route".into(),
+                "function".into(),
                 "cache".into(),
             ],
             input_schema: json!({
@@ -759,6 +813,9 @@ impl Tool for GcpNetworkInventorySync {
         let mut vpcs = 0usize;
         let mut subnets = 0usize;
         let mut addrs = 0usize;
+        let mut sgs = 0usize;
+        let mut routes = 0usize;
+        let mut funcs = 0usize;
         for p in profiles {
             let r = region.or(p.default_region.as_deref());
             match source.sync_network(p, r).await {
@@ -766,26 +823,37 @@ impl Tool for GcpNetworkInventorySync {
                     vpcs += inv.vpcs.len();
                     subnets += inv.subnets.len();
                     addrs += inv.addresses.len();
+                    sgs += inv.security_groups.len();
+                    routes += inv.routes.len();
+                    funcs += inv.functions.len();
                     let _ = write_network_cache(&ctx.config_dir, &inv);
                     details.push(format!(
-                        "{}: vpcs={} subnets={} addresses={}",
+                        "{}: vpcs={} subnets={} addresses={} firewalls={} routes={} functions={}",
                         p.id,
                         inv.vpcs.len(),
                         inv.subnets.len(),
-                        inv.addresses.len()
+                        inv.addresses.len(),
+                        inv.security_groups.len(),
+                        inv.routes.len(),
+                        inv.functions.len()
                     ));
                 }
                 Err(e) => details.push(format!("{}: ERROR {e}", p.id)),
             }
         }
         ToolResult::success(
-            format!("GCP network sync: {vpcs} vpcs, {subnets} subnets, {addrs} addresses"),
+            format!(
+                "GCP network sync: {vpcs} vpcs, {subnets} subnets, {addrs} addresses, {sgs} firewalls, {routes} routes, {funcs} functions"
+            ),
             json!({
                 "cloud": "gcp",
                 "format": "NetworkInventory",
                 "vpcs": vpcs,
                 "subnets": subnets,
                 "addresses": addrs,
+                "security_groups": sgs,
+                "routes": routes,
+                "functions": funcs,
                 "details": details
             }),
         )
@@ -798,8 +866,10 @@ impl Tool for GcpNetworkPatternSearch {
         static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
         META.get_or_init(|| ToolMeta {
             id: "gcp.network.pattern.search".into(),
-            name: "Pattern search VPC networks, subnets, IPs".into(),
-            description: discovery_blurb("GCP VPC networks, subnets, and addresses"),
+            name: "Pattern search VPC, subnets, firewalls, routes, functions".into(),
+            description: discovery_blurb(
+                "GCP VPC networks, subnets, addresses, firewall rules, routes, and Cloud Functions/Cloud Run",
+            ),
             domain: ToolDomain::Network,
             clouds: vec![Cloud::Gcp],
             capability: Capability::Read,
@@ -811,6 +881,9 @@ impl Tool for GcpNetworkPatternSearch {
                 "vpc".into(),
                 "ip".into(),
                 "cidr".into(),
+                "firewall".into(),
+                "route".into(),
+                "function".into(),
                 "partial".into(),
             ],
             input_schema: json!({
@@ -823,7 +896,7 @@ impl Tool for GcpNetworkPatternSearch {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        gcp_net_pattern(args, ctx, false).await
+        gcp_net_pattern(args, ctx, None).await
     }
 }
 
@@ -849,7 +922,305 @@ impl Tool for GcpNetworkSubnetPattern {
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        gcp_net_pattern(args, ctx, true).await
+        gcp_net_pattern(args, ctx, Some(&["subnet"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for GcpNetworkVpcPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "gcp.network.vpc.pattern".into(),
+            name: "Pattern search GCP VPC networks".into(),
+            description: discovery_blurb("GCP VPC networks by name, selfLink, or CIDR"),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Gcp],
+            capability: Capability::Read,
+            tags: vec!["vpc".into(), "network".into(), "pattern".into(), "search".into(), "partial".into()],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        gcp_net_pattern(args, ctx, Some(&["vpc"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for GcpNetworkFirewallPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "gcp.network.firewall.pattern".into(),
+            name: "Pattern search GCP firewall rules".into(),
+            description: discovery_blurb(
+                "GCP VPC firewall rules (security-group equivalent) by name, description, or network",
+            ),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Gcp],
+            capability: Capability::Read,
+            tags: vec![
+                "firewall".into(),
+                "security-group".into(),
+                "pattern".into(),
+                "search".into(),
+                "network".into(),
+                "partial".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        gcp_net_pattern(args, ctx, Some(&["security_group"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for GcpNetworkRoutePattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "gcp.network.route.pattern".into(),
+            name: "Pattern search GCP routes".into(),
+            description: discovery_blurb(
+                "GCP VPC routes by name, destination CIDR (destRange), or next-hop target",
+            ),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Gcp],
+            capability: Capability::Read,
+            tags: vec!["route".into(), "pattern".into(), "search".into(), "cidr".into(), "network".into(), "partial".into()],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        gcp_net_pattern(args, ctx, Some(&["route"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for GcpNetworkRouteTablePattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "gcp.network.route_table.pattern".into(),
+            name: "Pattern search GCP route tables".into(),
+            description: discovery_blurb(
+                "GCP synthetic global route table summarizing project VPC routes (GCP has no classic route tables)",
+            ),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Gcp],
+            capability: Capability::Read,
+            tags: vec!["route-table".into(), "route".into(), "pattern".into(), "search".into(), "network".into()],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        gcp_net_pattern(args, ctx, Some(&["route_table"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for GcpComputeFunctionPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "gcp.compute.function.pattern".into(),
+            name: "Pattern search Cloud Functions / Cloud Run".into(),
+            description: discovery_blurb(
+                "GCP Cloud Functions and Cloud Run services by name, runtime, URL, or region",
+            ),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Gcp],
+            capability: Capability::Read,
+            tags: vec![
+                "function".into(),
+                "cloud-functions".into(),
+                "cloud-run".into(),
+                "compute".into(),
+                "pattern".into(),
+                "search".into(),
+                "serverless".into(),
+                "partial".into(),
+            ],
+            input_schema: json!({
+                "type": "object",
+                "properties": pattern_properties(),
+                "required": ["pattern"]
+            }),
+            output_schema: None,
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        gcp_net_pattern(args, ctx, Some(&["function"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for GcpNetworkPeeringPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "gcp.network.peering.pattern".into(),
+            name: "Pattern search VPC network peerings".into(),
+            description: discovery_blurb("GCP VPC network peerings by name, network, or state"),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Gcp],
+            capability: Capability::Read,
+            tags: vec!["peering".into(), "vpc".into(), "pattern".into(), "search".into(), "network".into(), "partial".into()],
+            input_schema: json!({"type":"object","properties":pattern_properties(),"required":["pattern"]}),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        gcp_net_pattern(args, ctx, Some(&["peering"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for GcpNetworkVpnPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "gcp.network.vpn.pattern".into(),
+            name: "Pattern search Cloud VPN tunnels".into(),
+            description: discovery_blurb("GCP Cloud VPN tunnels by name, network, peer IP, or status"),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Gcp],
+            capability: Capability::Read,
+            tags: vec!["vpn".into(), "hybrid".into(), "pattern".into(), "search".into(), "network".into(), "partial".into()],
+            input_schema: json!({"type":"object","properties":pattern_properties(),"required":["pattern"]}),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        gcp_net_pattern(args, ctx, Some(&["vpn"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for GcpNetworkHybridPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "gcp.network.hybrid.pattern".into(),
+            name: "Pattern search Cloud Interconnect".into(),
+            description: discovery_blurb("GCP Cloud Interconnect / hybrid links by name or status"),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Gcp],
+            capability: Capability::Read,
+            tags: vec!["interconnect".into(), "hybrid".into(), "cross-cloud".into(), "pattern".into(), "search".into(), "network".into()],
+            input_schema: json!({"type":"object","properties":pattern_properties(),"required":["pattern"]}),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        gcp_net_pattern(args, ctx, Some(&["hybrid_connection"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for GcpNetworkNatPattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "gcp.network.nat.pattern".into(),
+            name: "Pattern search Cloud NAT".into(),
+            description: discovery_blurb("GCP Cloud NAT configs on Cloud Routers by name or network"),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Gcp],
+            capability: Capability::Read,
+            tags: vec!["nat".into(), "cloud-nat".into(), "pattern".into(), "search".into(), "network".into(), "egress".into()],
+            input_schema: json!({"type":"object","properties":pattern_properties(),"required":["pattern"]}),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        gcp_net_pattern(args, ctx, Some(&["nat_gateway"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for GcpNetworkSharePattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "gcp.network.share.pattern".into(),
+            name: "Pattern search Shared VPC".into(),
+            description: discovery_blurb("GCP Shared VPC host/service associations (network sharing)"),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Gcp],
+            capability: Capability::Read,
+            tags: vec!["shared-vpc".into(), "share".into(), "pattern".into(), "search".into(), "network".into(), "host-project".into()],
+            input_schema: json!({"type":"object","properties":pattern_properties(),"required":["pattern"]}),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        gcp_net_pattern(args, ctx, Some(&["network_share"])).await
+    }
+}
+
+#[async_trait]
+impl Tool for GcpNetworkServicePattern {
+    fn meta(&self) -> &ToolMeta {
+        static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
+        META.get_or_init(|| ToolMeta {
+            id: "gcp.network.service.pattern".into(),
+            name: "Pattern search all GCP network fabric services".into(),
+            description: discovery_blurb(
+                "GCP peering, VPN, Interconnect, Cloud NAT, Shared VPC — broad fabric service search",
+            ),
+            domain: ToolDomain::Network,
+            clouds: vec![Cloud::Gcp],
+            capability: Capability::Read,
+            tags: vec![
+                "network".into(), "service".into(), "pattern".into(), "search".into(), "peering".into(),
+                "vpn".into(), "interconnect".into(), "nat".into(), "shared-vpc".into(), "partial".into(),
+            ],
+            input_schema: json!({"type":"object","properties":pattern_properties(),"required":["pattern"]}),
+            output_schema: None,
+        })
+    }
+    async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        gcp_net_pattern(
+            args,
+            ctx,
+            Some(&[
+                "peering",
+                "vpn",
+                "hybrid_connection",
+                "nat_gateway",
+                "network_share",
+                "private_endpoint",
+                "transit_gateway",
+            ]),
+        )
+        .await
     }
 }
 
@@ -889,6 +1260,6 @@ impl Tool for GcpNetworkIpLocate {
             }
             obj.insert("mode".into(), json!("ip_or_cidr"));
         }
-        gcp_net_pattern(args, ctx, false).await
+        gcp_net_pattern(args, ctx, None).await
     }
 }

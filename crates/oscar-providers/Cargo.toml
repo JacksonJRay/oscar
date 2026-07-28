@@ -11,9 +11,10 @@ oscar-identity.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+dirs.workspace = true
 eventsource-stream.workspace = true
 futures.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
@@ -21,3 +22,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

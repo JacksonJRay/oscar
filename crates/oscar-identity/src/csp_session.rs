@@ -64,9 +64,11 @@ pub fn resolve_aws_process_creds(
             env.insert("AWS_SESSION_TOKEN".into(), tok);
             source = AuthSource::ShortLived;
         }
-        // Avoid picking up conflicting ambient AWS_PROFILE / metadata
+        // Avoid ambient profile/metadata clobbering keychain keys.
+        // Do NOT set AWS_PROFILE="" — AWS CLI treats that as a real profile
+        // name and fails with: "The config profile () could not be found".
+        // Callers must clear AWS_PROFILE when spawning (see aws_runtime).
         env.insert("AWS_EC2_METADATA_DISABLED".into(), "true".into());
-        env.insert("AWS_PROFILE".into(), "".into());
         if let Some(r) = &profile.default_region {
             env.insert("AWS_DEFAULT_REGION".into(), r.clone());
             env.insert("AWS_REGION".into(), r.clone());
@@ -79,27 +81,40 @@ pub fn resolve_aws_process_creds(
     }
 
     // Ambient binary session only when safe for this multi-profile account binding.
-    if let Some(ambient_account) = aws_caller_account(None) {
-        if profile_allows_ambient_account(profile, &ambient_account) {
-            let mut env = HashMap::new();
-            if let Some(r) = &profile.default_region {
-                env.insert("AWS_DEFAULT_REGION".into(), r.clone());
-                env.insert("AWS_REGION".into(), r.clone());
+    // Named labels (vdms, prod, …) must NOT silently inherit the shell's default
+    // account — that made "aws-vdms" report 0 zones from the wrong account.
+    if profile_allows_ambient_fallback(profile) {
+        if let Some(ambient_account) = aws_caller_account(None) {
+            if profile_allows_ambient_account(profile, &ambient_account) {
+                let mut env = HashMap::new();
+                if let Some(r) = &profile.default_region {
+                    env.insert("AWS_DEFAULT_REGION".into(), r.clone());
+                    env.insert("AWS_REGION".into(), r.clone());
+                }
+                return Ok(ProcessCreds {
+                    env,
+                    source: AuthSource::BinarySession,
+                    expires_at_unix: None,
+                });
             }
-            return Ok(ProcessCreds {
-                env,
-                source: AuthSource::BinarySession,
-                expires_at_unix: None,
-            });
+            // Ambient is a *different* account — require profile-scoped short-lived keys / SSO for this id.
+            return Err(auth_aws_needed(profile, false).with_guidance(format!(
+                "Ambient `aws` CLI is account `{ambient_account}`, but profile `{}` targets `{}`. \
+                 Paste short-lived keys for this profile in the secure bar (bulk `export AWS_*` paste ok), \
+                 or `oscar auth aws-session --profile {}`. Multi-account isolation: each oscar profile uses its own keychain namespace.",
+                profile.id,
+                profile.account_ref,
+                profile.id
+            )));
         }
-        // Ambient is a *different* account — require profile-scoped short-lived keys / SSO for this id.
+    } else if let Some(ambient_account) = aws_caller_account(None) {
+        // Named profile without keychain: explain instead of silent wrong-account scan.
         return Err(auth_aws_needed(profile, false).with_guidance(format!(
-            "Ambient `aws` CLI is account `{ambient_account}`, but profile `{}` targets `{}`. \
-             Paste short-lived keys for this profile in the secure bar, or `oscar auth aws-session --profile {}`, \
-             or assume-role into this profile. Multi-account isolation: each oscar profile uses its own keychain namespace.",
-            profile.id,
-            profile.account_ref,
-            profile.id
+            "Profile `{}` (label `{}`) has no keychain keys. Ambient CLI is account `{ambient_account}` — \
+             refusing to use it so we do not search the wrong account. \
+             Paste STS/session keys in the secure bar (one block of export AWS_ACCESS_KEY_ID / SECRET / SESSION_TOKEN) \
+             or run `oscar auth aws-session --profile {}`.",
+            profile.id, profile.label, profile.id
         )));
     }
 
@@ -117,11 +132,230 @@ pub fn profile_has_fixed_account(profile: &Profile) -> bool {
         && a != "n/a"
 }
 
+/// Ambient shell credentials are only allowed for default/ambient-style profiles.
+/// Named multi-account labels always need profile-scoped keychain secrets.
+pub fn profile_allows_ambient_fallback(profile: &Profile) -> bool {
+    let label = profile.label.trim().to_ascii_lowercase();
+    let id = profile.id.trim().to_ascii_lowercase();
+    matches!(
+        label.as_str(),
+        "default" | "ambient" | "local" | "shell" | ""
+    ) || id == "aws-default"
+        || id == "aws-ambient"
+        || id.ends_with("-default")
+        || id.ends_with("-ambient")
+}
+
 fn profile_allows_ambient_account(profile: &Profile, ambient_account: &str) -> bool {
+    if !profile_allows_ambient_fallback(profile) {
+        return false;
+    }
     if !profile_has_fixed_account(profile) {
         return true;
     }
     profile.account_ref.trim() == ambient_account.trim()
+}
+
+/// True when text looks like chat/transcript rather than a secret value.
+pub fn looks_like_transcript_not_secret(s: &str) -> bool {
+    let low = s.to_ascii_lowercase();
+    // Full-chat copies often start with role prefixes or tool chrome.
+    if low.starts_with("user:")
+        || low.starts_with("assistant:")
+        || low.starts_with("thinking:")
+        || low.starts_with("tool:")
+        || low.starts_with("error:")
+        || low.starts_with("notice:")
+    {
+        return true;
+    }
+    let hits = [
+        "user: ",
+        "assistant: ",
+        "thinking: ",
+        "tool: ◆",
+        "credentials needed",
+        "secure bar",
+        "✓ done",
+    ]
+    .iter()
+    .filter(|p| low.contains(*p))
+    .count();
+    hits >= 2 || s.lines().count() > 8 && hits >= 1
+}
+
+/// Shape-check an AWS secret before writing to the durable store.
+/// Rejects chat transcripts and obviously wrong lengths so a bad paste cannot
+/// poison a previously valid key set.
+pub fn validate_aws_secret_value(kind: SecretKind, value: &str) -> Result<(), String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Err("empty secret".into());
+    }
+    if looks_like_transcript_not_secret(v) {
+        return Err(
+            "paste looks like chat/transcript, not credentials — copy only the export AWS_* block into the secure bar"
+                .into(),
+        );
+    }
+    match kind {
+        SecretKind::AccessKeyId => {
+            // AKIA (long-lived) / ASIA (STS) / AROA etc. — keep loose but length-bound.
+            if v.len() < 16 || v.len() > 128 {
+                return Err(format!(
+                    "AWS access key id has unexpected length {} (expected 16–128)",
+                    v.len()
+                ));
+            }
+            if v.contains('\n') || v.contains(' ') {
+                return Err("AWS access key id must be a single token (no spaces/newlines)".into());
+            }
+            let ok_prefix = v.starts_with("AKIA")
+                || v.starts_with("ASIA")
+                || v.starts_with("AROA")
+                || v.starts_with("AIDA")
+                || v.chars().all(|c| c.is_ascii_alphanumeric());
+            if !ok_prefix {
+                return Err("AWS access key id has unexpected shape".into());
+            }
+        }
+        SecretKind::SecretAccessKey => {
+            if v.len() < 20 || v.len() > 128 {
+                return Err(format!(
+                    "AWS secret access key has unexpected length {} (expected 20–128)",
+                    v.len()
+                ));
+            }
+            if v.contains('\n') {
+                return Err("AWS secret access key must be a single line".into());
+            }
+        }
+        SecretKind::SessionToken => {
+            if v.len() < 20 || v.len() > 4096 {
+                return Err(format!(
+                    "AWS session token has unexpected length {} (expected 20–4096)",
+                    v.len()
+                ));
+            }
+            // Tokens are long base64-ish; reject multi-paragraph pastes.
+            if v.lines().count() > 3 {
+                return Err("AWS session token has too many lines".into());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Whether the profile has durable AWS access+secret keys stored (file/keychain).
+/// Does not call STS — used to stop prepare→auth loops after a successful paste.
+pub fn profile_has_stored_aws_keys(profile: &Profile) -> bool {
+    let ak = KeychainStore::get(&profile.secret_keyring_id, SecretKind::AccessKeyId)
+        .ok()
+        .flatten();
+    let sk = KeychainStore::get(&profile.secret_keyring_id, SecretKind::SecretAccessKey)
+        .ok()
+        .flatten();
+    match (ak, sk) {
+        (Some(a), Some(s)) => {
+            validate_aws_secret_value(SecretKind::AccessKeyId, &a).is_ok()
+                && validate_aws_secret_value(SecretKind::SecretAccessKey, &s).is_ok()
+        }
+        _ => false,
+    }
+}
+
+/// Parse shell-style AWS credential exports from a secure-bar paste.
+/// Supports multi-line `export AWS_ACCESS_KEY_ID=…` blocks (and KEY=value without export).
+/// Returns only recognized, shape-validated fields; never logs values.
+pub fn parse_aws_env_exports(paste: &str) -> Vec<(SecretKind, String)> {
+    // Reject whole-chat pastes early (common when click-copy dumps the transcript).
+    if looks_like_transcript_not_secret(paste) && !paste.contains("AWS_ACCESS_KEY_ID") {
+        return Vec::new();
+    }
+    let mut map: HashMap<String, String> = HashMap::new();
+    for raw_line in paste.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line
+            .strip_prefix("export ")
+            .or_else(|| line.strip_prefix("Export "))
+            .unwrap_or(line)
+            .trim();
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim().to_ascii_uppercase();
+        let mut val = v.trim().to_string();
+        // Strip matching quotes
+        if (val.starts_with('"') && val.ends_with('"'))
+            || (val.starts_with('\'') && val.ends_with('\''))
+        {
+            val = val[1..val.len() - 1].to_string();
+        }
+        if !val.is_empty() {
+            map.insert(key, val);
+        }
+    }
+    // Also accept single-line whitespace-separated export forms (rare).
+    if map.is_empty() {
+        for part in paste.split_whitespace() {
+            let part = part
+                .strip_prefix("export")
+                .map(|s| s.trim_start_matches(|c: char| c == '=' || c.is_whitespace()))
+                .unwrap_or(part);
+            if let Some((k, v)) = part.split_once('=') {
+                let key = k.trim().to_ascii_uppercase();
+                if key.starts_with("AWS_") && !v.is_empty() {
+                    map.insert(key, v.trim_matches(|c| c == '"' || c == '\'').to_string());
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(v) = map.remove("AWS_ACCESS_KEY_ID") {
+        if validate_aws_secret_value(SecretKind::AccessKeyId, &v).is_ok() {
+            out.push((SecretKind::AccessKeyId, v));
+        }
+    }
+    if let Some(v) = map.remove("AWS_SECRET_ACCESS_KEY") {
+        if validate_aws_secret_value(SecretKind::SecretAccessKey, &v).is_ok() {
+            out.push((SecretKind::SecretAccessKey, v));
+        }
+    }
+    if let Some(v) = map.remove("AWS_SESSION_TOKEN") {
+        if validate_aws_secret_value(SecretKind::SessionToken, &v).is_ok() {
+            out.push((SecretKind::SessionToken, v));
+        }
+    }
+    out
+}
+
+/// After successful STS, pin profile.account_ref when it was pending/unknown.
+pub fn bind_aws_account_ref_if_pending(profile: &Profile, account_id: &str) -> OscarResult<bool> {
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+        return Ok(false);
+    }
+    if profile_has_fixed_account(profile) && profile.account_ref.trim() == account_id {
+        return Ok(false);
+    }
+    if profile_has_fixed_account(profile) {
+        // Already pinned to a different id — do not overwrite silently.
+        return Ok(false);
+    }
+    let paths = oscar_core::Paths::discover()?;
+    let mut store = crate::profiles::ProfileStore::load(&paths)?;
+    let Some(existing) = store.get(&profile.id).cloned() else {
+        return Ok(false);
+    };
+    let mut updated = existing;
+    updated.account_ref = account_id.to_string();
+    store.upsert(updated);
+    store.save()?;
+    Ok(true)
 }
 
 /// Account id from ambient or env-scoped `aws sts get-caller-identity` (no secrets).
@@ -170,25 +404,70 @@ pub fn store_aws_short_lived(
     session_token: &str,
     expires_at_unix: Option<u64>,
 ) -> OscarResult<()> {
+    for (kind, val) in [
+        (SecretKind::AccessKeyId, access_key_id),
+        (SecretKind::SecretAccessKey, secret_access_key),
+        (SecretKind::SessionToken, session_token),
+    ] {
+        if let Err(e) = validate_aws_secret_value(kind, val) {
+            return Err(OscarError::Config(format!("invalid {kind:?}: {e}")));
+        }
+    }
     KeychainStore::set(
         &profile.secret_keyring_id,
         SecretKind::AccessKeyId,
-        access_key_id,
+        access_key_id.trim(),
     )?;
     KeychainStore::set(
         &profile.secret_keyring_id,
         SecretKind::SecretAccessKey,
-        secret_access_key,
+        secret_access_key.trim(),
     )?;
     KeychainStore::set(
         &profile.secret_keyring_id,
         SecretKind::SessionToken,
-        session_token,
+        session_token.trim(),
     )?;
     if let Some(exp) = expires_at_unix {
         store_aws_session_expiry(profile, exp)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oscar_core::SecretKind;
+
+    #[test]
+    fn parse_aws_export_block() {
+        let paste = r#"
+export AWS_ACCESS_KEY_ID=ASIAEXAMPLEKEY1234
+export AWS_SECRET_ACCESS_KEY=secret/value+hereABCDEFGHijkl
+export AWS_SESSION_TOKEN=FwoGZXIvYXdzEThisIsALongEnoughSessionTokenValueForValidation
+"#;
+        let fields = parse_aws_env_exports(paste);
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].0, SecretKind::AccessKeyId);
+        assert_eq!(fields[0].1, "ASIAEXAMPLEKEY1234");
+        assert_eq!(fields[1].0, SecretKind::SecretAccessKey);
+        assert_eq!(fields[2].0, SecretKind::SessionToken);
+    }
+
+    #[test]
+    fn rejects_transcript_as_access_key() {
+        let bad = "user: switch to vdms\nthinking: foo\ntool: ◆ system.access.prepare";
+        assert!(looks_like_transcript_not_secret(bad));
+        assert!(validate_aws_secret_value(SecretKind::AccessKeyId, bad).is_err());
+    }
+
+    #[test]
+    fn named_profile_rejects_ambient_fallback() {
+        let p = Profile::new(Cloud::Aws, "vdms", "pending");
+        assert!(!profile_allows_ambient_fallback(&p));
+        let d = Profile::new(Cloud::Aws, "default", "pending");
+        assert!(profile_allows_ambient_fallback(&d));
+    }
 }
 
 pub fn store_aws_long_lived(
@@ -234,6 +513,11 @@ pub fn validate_aws(profile: &Profile, binaries: &BinaryInventory) -> OscarResul
     for (k, v) in &creds.env {
         cmd.env(k, v);
     }
+    // Explicit keys must not fight ambient AWS_PROFILE from the shell.
+    if creds.env.contains_key("AWS_ACCESS_KEY_ID") {
+        cmd.env_remove("AWS_PROFILE");
+        cmd.env_remove("AWS_DEFAULT_PROFILE");
+    }
     let out = cmd
         .output()
         .map_err(|e| OscarError::Tool(format!("aws: {e}")))?;
@@ -241,7 +525,14 @@ pub fn validate_aws(profile: &Profile, binaries: &BinaryInventory) -> OscarResul
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(OscarError::AuthRequired(err.trim().to_string()));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Pin pending account_ref after successful STS.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+        if let Some(acct) = v.get("Account").and_then(|a| a.as_str()) {
+            let _ = bind_aws_account_ref_if_pending(profile, acct);
+        }
+    }
+    Ok(text)
 }
 
 /// Attempt STS assume-role using current binary/keychain base, store short-lived into profile.
@@ -270,6 +561,10 @@ pub fn assume_role_into_profile(
     ]);
     for (k, v) in &base.env {
         cmd.env(k, v);
+    }
+    if base.env.contains_key("AWS_ACCESS_KEY_ID") {
+        cmd.env_remove("AWS_PROFILE");
+        cmd.env_remove("AWS_DEFAULT_PROFILE");
     }
     let out = cmd
         .output()
@@ -431,7 +726,10 @@ pub fn auth_request_from_error(
         Cloud::Aws => "Re-authenticate with short-lived STS/SSO or paste new keys into oscar keychain.",
         Cloud::Gcp => "Run gcloud auth login / application-default, or store a service account JSON in oscar keychain.",
         Cloud::Azure => "Run az login or store service principal secrets in oscar keychain.",
-        Cloud::K8s => "Refresh kubeconfig or paste a valid kubeconfig into oscar keychain.",
+        Cloud::K8s => {
+            "Refresh cluster auth via system.cluster.prepare by kind: \
+             EKS→AWS STS; GKE/AKS→cloud short-lived; kind/k3s/local→kubeconfig."
+        }
         Cloud::Multi => "Re-authenticate the relevant cloud profile.",
     })
     .with_hints(match cloud {
@@ -444,7 +742,11 @@ pub fn auth_request_from_error(
             "gcloud auth application-default login".to_string(),
         ],
         Cloud::Azure => vec!["az login".to_string()],
-        Cloud::K8s => vec!["kubectl config view".to_string()],
+        Cloud::K8s => vec![
+            "system.cluster.prepare cluster_kind=… label=…".to_string(),
+            "kubectl config view".to_string(),
+            "aws eks update-kubeconfig # when kind=eks".to_string(),
+        ],
         Cloud::Multi => Vec::<String>::new(),
     });
     if let Some(id) = profile_id {

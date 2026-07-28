@@ -515,8 +515,35 @@ pub fn required_binaries_for_tool(tool_id: &str) -> Vec<&'static str> {
     {
         return vec![]; // soft: can use public resolver / cache
     }
-    if tool_id == "network.pattern.find" {
-        return vec![]; // cache only
+    if tool_id == "network.pattern.find"
+        || tool_id == "network.ip.locate"
+        || tool_id == "network.troubleshoot.playbook"
+        || tool_id == "network.troubleshoot.status"
+    {
+        return vec![]; // cache / pure logic (status may use ip optionally)
+    }
+    if tool_id.starts_with("node.net.") {
+        // Prefer iproute2; tools degrade with install hints if missing
+        if tool_id.contains("ss") {
+            return vec!["ss"];
+        }
+        if tool_id.contains("ping") {
+            return vec!["ping"];
+        }
+        if tool_id.contains("traceroute") {
+            return vec![]; // mtr|traceroute|tracepath — soft
+        }
+        if tool_id.contains("dns") {
+            return vec![]; // dig|getent soft
+        }
+        return vec!["ip"];
+    }
+    if tool_id.starts_with("node.bpf.") {
+        return vec!["bpftool"];
+    }
+    if tool_id.starts_with("mesh.envoy.") {
+        // curl for local admin; kubectl when pod= is used (checked at runtime)
+        return vec!["curl"];
     }
     if tool_id.starts_with("system.") || tool_id.starts_with("access.") {
         return vec![];

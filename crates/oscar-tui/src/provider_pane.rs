@@ -1,82 +1,16 @@
 //! Dedicated LLM provider setup UI — list providers, set default, auth, edit model/URL.
 //!
-//! Auth model (all use API keys after account access where needed):
-//! - **xAI / OpenCode Zen/Go**: open console in browser → create/copy key → paste securely
-//! - **OpenAI / Anthropic**: open API keys page → paste key
+//! Driven by oscar-providers catalog (models.dev + builtins). Auth:
+//! - **xAI**: OAuth (`oscar auth login`) or API key paste
+//! - **Others**: open console → paste API key into AuthStore (secure bar)
 //! - **Custom**: set id + base_url + paste key
 
 use oscar_core::config::{OscarConfig, ProviderSettings};
-use oscar_identity::load_provider_api_key;
-
-/// Built-in providers shown in the picker (Grok primary).
-pub const BUILTIN_PROVIDERS: &[ProviderMeta] = &[
-    ProviderMeta {
-        id: "grok",
-        name: "Grok (xAI) ★ primary",
-        auth_hint: "oscar auth login (OAuth) · or console.x.ai API key",
-        console_url: "https://console.x.ai/team/default/api-keys",
-        default_base: "https://api.x.ai/v1",
-        default_model: "grok-4",
-        needs_account: true,
-    },
-    ProviderMeta {
-        id: "xai",
-        name: "xAI (alias of Grok)",
-        auth_hint: "Same as Grok — OAuth or API key (shared keychain)",
-        console_url: "https://console.x.ai/team/default/api-keys",
-        default_base: "https://api.x.ai/v1",
-        default_model: "grok-4",
-        needs_account: true,
-    },
-    ProviderMeta {
-        id: "openai",
-        name: "OpenAI",
-        auth_hint: "platform.openai.com → API keys → paste sk-… key",
-        console_url: "https://platform.openai.com/api-keys",
-        default_base: "https://api.openai.com/v1",
-        default_model: "gpt-4.1",
-        needs_account: false,
-    },
-    ProviderMeta {
-        id: "anthropic",
-        name: "Anthropic (Claude)",
-        auth_hint: "console.anthropic.com → API keys → paste key",
-        console_url: "https://console.anthropic.com/settings/keys",
-        default_base: "https://api.anthropic.com",
-        default_model: "claude-sonnet-4-5",
-        needs_account: false,
-    },
-    ProviderMeta {
-        id: "opencode-zen",
-        name: "OpenCode Zen",
-        auth_hint: "Sign in at opencode.ai/auth → copy Zen API key → paste",
-        console_url: "https://opencode.ai/auth",
-        default_base: "https://opencode.ai/zen/v1",
-        default_model: "default",
-        needs_account: true,
-    },
-    ProviderMeta {
-        id: "opencode-go",
-        name: "OpenCode Go",
-        auth_hint: "Sign in at opencode.ai/auth → subscribe Go → copy key → paste",
-        console_url: "https://opencode.ai/auth",
-        default_base: "https://opencode.ai/zen/v1",
-        default_model: "default",
-        needs_account: true,
-    },
-];
-
-#[derive(Debug, Clone, Copy)]
-pub struct ProviderMeta {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub auth_hint: &'static str,
-    pub console_url: &'static str,
-    pub default_base: &'static str,
-    pub default_model: &'static str,
-    /// True if user typically signs into a console first (xAI / OpenCode).
-    pub needs_account: bool,
-}
+use oscar_core::Paths;
+use oscar_providers::{
+    default_base_url, default_model_for, list_provider_ui_meta, provider_display_name,
+    provider_has_credentials,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderFocus {
@@ -201,26 +135,40 @@ impl ProviderPane {
     }
 
     fn rebuild_rows(&mut self) {
-        let mut rows: Vec<ProviderRow> = BUILTIN_PROVIDERS
-            .iter()
+        // Large catalog; UI scrolls via ListState so we can show the full set.
+        let meta = list_provider_ui_meta(&self.config.catalog, 200);
+        let mut rows: Vec<ProviderRow> = meta
+            .into_iter()
             .map(|m| ProviderRow {
-                id: m.id.into(),
-                name: m.name.into(),
-                is_builtin: true,
+                id: m.id,
+                name: m.name,
+                is_builtin: m.is_builtin,
                 needs_account: m.needs_account,
-                console_url: m.console_url.into(),
-                auth_hint: m.auth_hint.into(),
-                default_base: m.default_base.into(),
-                default_model: m.default_model.into(),
+                console_url: m.console_url,
+                auth_hint: m.auth_hint,
+                default_base: m.default_base,
+                default_model: m.default_model,
             })
             .collect();
 
-        // Custom active provider not in builtins
-        let id = self.config.provider.id.as_str();
-        if !BUILTIN_PROVIDERS.iter().any(|m| m.id == id) && !id.is_empty() {
+        // Active / slotted providers not already listed
+        let mut known: std::collections::HashSet<String> =
+            rows.iter().map(|r| r.id.clone()).collect();
+        let mut extra_ids: Vec<String> = Vec::new();
+        if !self.config.provider.id.is_empty() {
+            extra_ids.push(self.config.provider.id.clone());
+        }
+        for id in self.config.providers.keys() {
+            extra_ids.push(id.clone());
+        }
+        for id in extra_ids {
+            if known.contains(&id) || id.is_empty() {
+                continue;
+            }
+            known.insert(id.clone());
             rows.push(ProviderRow {
-                id: id.into(),
-                name: format!("Custom ({id})"),
+                id: id.clone(),
+                name: provider_display_name(&id),
                 is_builtin: false,
                 needs_account: false,
                 console_url: self
@@ -228,20 +176,22 @@ impl ProviderPane {
                     .provider
                     .base_url
                     .clone()
+                    .or_else(|| default_base_url(&id))
                     .unwrap_or_else(|| "https://…".into()),
-                auth_hint: "Custom OpenAI-compatible endpoint + API key".into(),
+                auth_hint: "API key via secure paste · oscar auth connect".into(),
                 default_base: self
                     .config
                     .provider
                     .base_url
                     .clone()
+                    .or_else(|| default_base_url(&id))
                     .unwrap_or_default(),
                 default_model: self
                     .config
                     .provider
                     .model
                     .clone()
-                    .unwrap_or_else(|| "default".into()),
+                    .unwrap_or_else(|| default_model_for(&id)),
             });
         }
         // Sentinel: add custom
@@ -266,11 +216,10 @@ impl ProviderPane {
     }
 
     pub fn has_key(id: &str) -> bool {
-        load_provider_api_key(id)
-            .ok()
-            .flatten()
-            .map(|k| !k.is_empty())
-            .unwrap_or(false)
+        if let Ok(paths) = Paths::discover() {
+            return provider_has_credentials(&paths, id);
+        }
+        false
     }
 
     pub fn is_default(&self, id: &str) -> bool {
@@ -469,8 +418,12 @@ impl ProviderPane {
                 self.flash = Some("Edit base URL · empty = provider default · Enter save · Esc cancel".into());
             }
             ProviderAction::ClearKey => {
-                let _ = oscar_identity::delete_provider_api_key(&row.id);
-                self.flash = Some(format!("Cleared keychain key for `{}`", row.id));
+                if let Ok(paths) = Paths::discover() {
+                    let _ = oscar_providers::auth_remove(&paths, &row.id);
+                } else {
+                    let _ = oscar_identity::delete_provider_api_key(&row.id);
+                }
+                self.flash = Some(format!("Cleared AuthStore + keychain for `{}`", row.id));
             }
             ProviderAction::AddCustom => self.start_add_custom(),
         }
@@ -511,7 +464,10 @@ impl ProviderPane {
                     .chars()
                     .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
                     .collect::<String>();
-                if id.is_empty() || BUILTIN_PROVIDERS.iter().any(|m| m.id == id) {
+                let reserved = id.is_empty()
+                    || id == "__add_custom__"
+                    || self.rows.iter().any(|r| r.id == id && r.is_builtin);
+                if reserved {
                     self.flash = Some("invalid or reserved id — try again".into());
                     self.edit = Some(ProviderEdit::CustomId {
                         buffer: id,

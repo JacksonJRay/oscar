@@ -36,8 +36,6 @@ impl Paths {
             auth_file: config_dir.join("auth.json"),
             config_dir,
         };
-        // Best-effort one-time import from the pre-rebrand config dir if oscar is empty.
-        let _ = migrate_legacy_config_dir(&paths);
         Ok(paths)
     }
 
@@ -48,55 +46,6 @@ impl Paths {
         fs::create_dir_all(&self.logs_dir)?;
         Ok(())
     }
-}
-
-/// Copy `~/.config/mind` → `~/.config/oscar` once when oscar has no user config yet.
-///
-/// Secrets in the OS keychain are **not** moved (keychain service is now `oscar`);
-/// re-store LLM/cloud keys with `oscar auth` if needed. Profiles metadata + sessions
-/// + MCP server list are copied.
-fn migrate_legacy_config_dir(paths: &Paths) -> OscarResult<bool> {
-    let Some(base) = dirs::config_dir() else {
-        return Ok(false);
-    };
-    let legacy = base.join("mind");
-    if !legacy.is_dir() {
-        return Ok(false);
-    }
-    // Skip if oscar already has config or profiles (user already set up).
-    if paths.config_file.exists() || paths.profiles_file.exists() {
-        return Ok(false);
-    }
-    let marker = paths.config_dir.join(".migrated_from_legacy");
-    if marker.exists() {
-        return Ok(false);
-    }
-
-    fs::create_dir_all(&paths.config_dir)?;
-    copy_dir_contents(&legacy, &paths.config_dir)?;
-    let note = format!(
-        "Imported user config from {} at {}.\n\
-         Keychain secrets still use service name oscar (re-run oscar auth for LLM/cloud keys if missing).\n",
-        legacy.display(),
-        chrono::Utc::now().to_rfc3339()
-    );
-    let _ = fs::write(&marker, note);
-    Ok(true)
-}
-
-fn copy_dir_contents(src: &std::path::Path, dst: &std::path::Path) -> OscarResult<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if from.is_dir() {
-            copy_dir_contents(&from, &to)?;
-        } else if !to.exists() {
-            fs::copy(&from, &to)?;
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +75,15 @@ pub struct OscarConfig {
     /// MCP servers — tools mount as first-class inventory entries (Code Mode).
     #[serde(default)]
     pub mcp: crate::mcp_config::McpSettings,
+    /// LLM auth policy (AuthStore + optional catalog env).
+    #[serde(default)]
+    pub auth: AuthSettings,
+    /// models.dev catalog fetch / filter.
+    #[serde(default)]
+    pub catalog: CatalogSettings,
+    /// Local SSE event bus (starts with TUI by default; watchdog restarts on failure).
+    #[serde(default)]
+    pub sse: SseSettings,
 }
 
 impl Default for OscarConfig {
@@ -140,6 +98,53 @@ impl Default for OscarConfig {
             tools: ToolsSettings::default(),
             skills: crate::skills::SkillsSettings::default(),
             mcp: crate::mcp_config::McpSettings::default(),
+            auth: AuthSettings::default(),
+            catalog: CatalogSettings::default(),
+            sse: SseSettings::default(),
+        }
+    }
+}
+
+/// LLM credential policy (OpenCode-aligned).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthSettings {
+    /// Dual-write API keys to OS keychain when setting AuthStore entries.
+    #[serde(default = "default_true")]
+    pub mirror_keychain: bool,
+    /// Allow reading catalog-advertised env vars (e.g. `XAI_API_KEY`). Default off.
+    #[serde(default)]
+    pub allow_catalog_env: bool,
+}
+
+impl Default for AuthSettings {
+    fn default() -> Self {
+        Self {
+            mirror_keychain: true,
+            allow_catalog_env: false,
+        }
+    }
+}
+
+/// models.dev provider catalog settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogSettings {
+    /// Fetch/use models.dev (disk cache). When false, static builtins only.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// If set, only these provider ids appear in connect lists.
+    #[serde(default)]
+    pub enabled_providers: Vec<String>,
+    /// Provider ids to hide from connect lists.
+    #[serde(default)]
+    pub disabled_providers: Vec<String>,
+}
+
+impl Default for CatalogSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            enabled_providers: vec![],
+            disabled_providers: vec![],
         }
     }
 }
@@ -338,6 +343,10 @@ impl OscarConfig {
     }
 
     /// Activate a loaded provider id (or new id) and optional model; updates `providers` map.
+    ///
+    /// Always replaces `provider.base_url` from the slot (or clears it so the
+    /// factory can apply the catalog default). Never leaves a prior CSP's URL
+    /// (e.g. NVIDIA) attached when switching to xAI/Grok.
     pub fn activate_provider(&mut self, provider_id: &str, model: Option<String>) {
         // Prefer saved slot settings when switching back.
         if let Some(slot) = self.providers.get(provider_id).cloned() {
@@ -347,6 +356,9 @@ impl OscarConfig {
             self.provider.api_key_env = slot.api_key_env;
         } else {
             self.provider.id = provider_id.to_string();
+            // Drop previous provider's base_url so catalog default applies.
+            self.provider.base_url = None;
+            self.provider.api_key_env = None;
             if let Some(m) = model {
                 self.provider.model = Some(m);
             }
@@ -416,6 +428,47 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             show_thinking: true,
+        }
+    }
+}
+
+/// Local HTTP + SSE event bus (OpenCode-style). Enabled by default with the TUI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SseSettings {
+    /// Start SSE hub when `oscar` (TUI) or `oscar serve` runs.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Bind address (host:port). Env `OSCAR_SSE_BIND` / `OSCAR_SERVE_BIND` override.
+    #[serde(default = "default_sse_bind")]
+    pub bind: String,
+    /// Restart the accept loop if it crashes or the socket dies.
+    #[serde(default = "default_true")]
+    pub watchdog: bool,
+    /// Initial restart delay in milliseconds (doubles up to max).
+    #[serde(default = "default_sse_backoff")]
+    pub restart_backoff_ms: u64,
+    #[serde(default = "default_sse_backoff_max")]
+    pub restart_backoff_max_ms: u64,
+}
+
+fn default_sse_bind() -> String {
+    "127.0.0.1:4096".into()
+}
+fn default_sse_backoff() -> u64 {
+    500
+}
+fn default_sse_backoff_max() -> u64 {
+    15_000
+}
+
+impl Default for SseSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind: default_sse_bind(),
+            watchdog: true,
+            restart_backoff_ms: default_sse_backoff(),
+            restart_backoff_max_ms: default_sse_backoff_max(),
         }
     }
 }
@@ -634,21 +687,5 @@ mod tests {
         assert!(back.tools.disabled_clouds.contains(&"gcp".into()));
         assert!(back.tools.disabled.contains(&"k8s.pods.list".into()));
         assert!(back.tools.agent_summary().contains("install-all"));
-    }
-
-    #[test]
-    fn copy_dir_contents_nested() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("src");
-        let dst = tmp.path().join("dst");
-        fs::create_dir_all(src.join("sessions")).unwrap();
-        fs::write(src.join("config.toml"), "mode = \"readonly\"\n").unwrap();
-        fs::write(src.join("sessions").join("a.json"), "{}").unwrap();
-        copy_dir_contents(&src, &dst).unwrap();
-        assert_eq!(
-            fs::read_to_string(dst.join("config.toml")).unwrap(),
-            "mode = \"readonly\"\n"
-        );
-        assert!(dst.join("sessions").join("a.json").is_file());
     }
 }

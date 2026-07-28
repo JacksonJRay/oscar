@@ -1,6 +1,6 @@
-//! AWS EC2 live fetch → unified [`NetworkInventory`] via CLI.
+//! AWS EC2 + Lambda + connectivity fabric → unified [`NetworkInventory`] via CLI.
 
-use crate::map_network::map_aws_ec2_to_network_inventory;
+use crate::map_network::map_aws_network_full;
 use async_trait::async_trait;
 use oscar_core::{Cloud, OscarError, OscarResult};
 use oscar_identity::{
@@ -50,18 +50,61 @@ impl NetworkInventorySource for AwsNetworkSource {
         let subnets = ec2_json(&env, &region, "describe-subnets")
             .await
             .map_err(|e| map_err(profile, e))?;
+        // Best-effort fabric — failures do not fail whole sync
         let enis = ec2_json(&env, &region, "describe-network-interfaces")
             .await
             .ok();
         let eips = ec2_json(&env, &region, "describe-addresses").await.ok();
+        let sgs = ec2_json(&env, &region, "describe-security-groups")
+            .await
+            .ok();
+        let nacls = ec2_json(&env, &region, "describe-network-acls")
+            .await
+            .ok();
+        let rts = ec2_json(&env, &region, "describe-route-tables")
+            .await
+            .ok();
+        let lambdas = lambda_list_functions(&env, &region).await.ok();
+        let peerings = ec2_json(&env, &region, "describe-vpc-peering-connections")
+            .await
+            .ok();
+        let tgws = ec2_json(&env, &region, "describe-transit-gateways")
+            .await
+            .ok();
+        let vpns = ec2_json(&env, &region, "describe-vpn-connections")
+            .await
+            .ok();
+        let endpoints = ec2_json(&env, &region, "describe-vpc-endpoints")
+            .await
+            .ok();
+        let nats = ec2_json(&env, &region, "describe-nat-gateways").await.ok();
+        let igws = ec2_json(&env, &region, "describe-internet-gateways")
+            .await
+            .ok();
+        let prefix_lists = ec2_json(&env, &region, "describe-managed-prefix-lists")
+            .await
+            .ok();
+        let dx = dx_connections(&env, &region).await.ok();
 
-        Ok(map_aws_ec2_to_network_inventory(
+        Ok(map_aws_network_full(
             &profile.id,
             Some(region),
             &vpcs,
             &subnets,
             enis.as_ref(),
             eips.as_ref(),
+            sgs.as_ref(),
+            nacls.as_ref(),
+            rts.as_ref(),
+            lambdas.as_ref(),
+            peerings.as_ref(),
+            tgws.as_ref(),
+            vpns.as_ref(),
+            endpoints.as_ref(),
+            nats.as_ref(),
+            igws.as_ref(),
+            prefix_lists.as_ref(),
+            dx.as_ref(),
         ))
     }
 }
@@ -83,9 +126,32 @@ async fn ec2_json(
     region: &str,
     op: &str,
 ) -> OscarResult<serde_json::Value> {
+    let args = ["ec2", op, "--region", region, "--output", "json"];
+    run_json_command_with_env("aws", &args, env).await
+}
+
+async fn lambda_list_functions(
+    env: &[(String, String)],
+    region: &str,
+) -> OscarResult<serde_json::Value> {
     let args = [
-        "ec2",
-        op,
+        "lambda",
+        "list-functions",
+        "--region",
+        region,
+        "--output",
+        "json",
+    ];
+    run_json_command_with_env("aws", &args, env).await
+}
+
+async fn dx_connections(
+    env: &[(String, String)],
+    region: &str,
+) -> OscarResult<serde_json::Value> {
+    let args = [
+        "directconnect",
+        "describe-connections",
         "--region",
         region,
         "--output",

@@ -20,6 +20,11 @@ pub fn resolve_profiles<'a>(
 }
 
 /// Resolve profiles for a cloud, honoring explicit id then session preferred profile.
+///
+/// When the agent omits `profile_id` and there is **no** session preferred profile,
+/// multi-profile clouds refuse the silent "first profile wins" fallback — callers
+/// should surface an error asking for `system.access.select` / explicit `profile_id`.
+/// Single-profile clouds still return that one profile.
 pub fn resolve_profiles_pref<'a>(
     store: &'a ProfileStore,
     cloud: Cloud,
@@ -36,7 +41,12 @@ pub fn resolve_profiles_pref<'a>(
             }
         }
     }
-    profiles_for_cloud(store, cloud)
+    let all = profiles_for_cloud(store, cloud);
+    if all.len() <= 1 {
+        return all;
+    }
+    // Ambiguous multi-profile: do not silently scan/use every account.
+    Vec::new()
 }
 
 /// Pick one profile for live tools: explicit → preferred → first matching cloud.
@@ -117,12 +127,16 @@ pub fn auth_for_with_profile(
         ]),
         Cloud::K8s => AuthRequest::new(Cloud::K8s, reason, vec![SecretKind::Kubeconfig])
             .with_guidance(
-                "Use a working kubectl context (kubeconfig). Oscar does not store cluster certs in chat.",
+                "Cluster auth depends on kind: EKS needs AWS short-lived creds (system.cluster.prepare cluster_kind=eks); \
+                 GKE/AKS need GCP/Azure short-lived; kind/k3s/local need kubeconfig only. \
+                 If kind is unknown, ask the user first — do not guess.",
             )
             .with_hints(vec![
+                "system.cluster.prepare cluster_kind=eks|gke|aks|kind|k3s|local label=…".to_string(),
                 "kubectl config get-contexts".to_string(),
                 "kubectl config use-context <name>".to_string(),
                 "kubectl cluster-info".to_string(),
+                "EKS: oscar auth aws-session on linked aws-* then aws eks update-kubeconfig".to_string(),
             ]),
         Cloud::Multi => AuthRequest::new(Cloud::Multi, reason, vec![SecretKind::Other]),
     };

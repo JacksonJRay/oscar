@@ -162,12 +162,149 @@ impl fmt::Display for ToolDomain {
     }
 }
 
-/// Reference to a Kubernetes cluster attached to a cloud profile.
+/// How a Kubernetes cluster authenticates (drives prepare/secret flow).
+///
+/// Managed clouds use short-lived cloud IdP tokens via kubeconfig `exec` plugins.
+/// Local clusters (kind/k3s/…) use a static kubeconfig (file or keychain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterKind {
+    /// Amazon EKS — AWS STS / SSO → `aws eks get-token` exec plugin.
+    Eks,
+    /// Google GKE — gcloud / ADC → gke-gcloud-auth-plugin (or legacy).
+    Gke,
+    /// Azure AKS — az / Entra → kubelogin exec plugin.
+    Aks,
+    /// kind (local Docker Kubernetes).
+    Kind,
+    /// k3s / k3d local.
+    K3s,
+    /// minikube local.
+    Minikube,
+    /// k0s local.
+    K0s,
+    /// Generic local / self-managed: kubeconfig only.
+    Local,
+    /// Unknown — agent must ask before preparing auth.
+    #[default]
+    Unknown,
+}
+
+impl ClusterKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "eks" | "amazon-eks" | "aws-eks" => Some(Self::Eks),
+            "gke" | "google-gke" | "gcp-gke" => Some(Self::Gke),
+            "aks" | "azure-aks" => Some(Self::Aks),
+            "kind" => Some(Self::Kind),
+            "k3s" | "k3d" => Some(Self::K3s),
+            "minikube" | "mk" => Some(Self::Minikube),
+            "k0s" => Some(Self::K0s),
+            "local" | "onprem" | "on-prem" | "self-managed" | "kubeconfig" | "generic" => {
+                Some(Self::Local)
+            }
+            "unknown" | "" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Eks => "eks",
+            Self::Gke => "gke",
+            Self::Aks => "aks",
+            Self::Kind => "kind",
+            Self::K3s => "k3s",
+            Self::Minikube => "minikube",
+            Self::K0s => "k0s",
+            Self::Local => "local",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// True for kind/k3s/minikube/k0s/local — kubeconfig is the credential surface.
+    pub fn is_local(self) -> bool {
+        matches!(
+            self,
+            Self::Kind | Self::K3s | Self::Minikube | Self::K0s | Self::Local
+        )
+    }
+
+    /// True when auth is short-lived via a linked cloud account (EKS/GKE/AKS).
+    pub fn is_managed_cloud(self) -> bool {
+        matches!(self, Self::Eks | Self::Gke | Self::Aks)
+    }
+
+    /// Linked CSP for managed clusters (if any).
+    pub fn linked_cloud(self) -> Option<Cloud> {
+        match self {
+            Self::Eks => Some(Cloud::Aws),
+            Self::Gke => Some(Cloud::Gcp),
+            Self::Aks => Some(Cloud::Azure),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ClusterKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Reference to a Kubernetes cluster attached to a cloud or k8s profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterRef {
     pub name: String,
     pub context: Option<String>,
     pub region: Option<String>,
+    /// Cluster flavor — drives credential prepare flow.
+    #[serde(default, skip_serializing_if = "cluster_kind_is_unknown")]
+    pub kind: ClusterKind,
+    /// For EKS/GKE/AKS: oscar cloud profile that holds short-lived CSP creds
+    /// (e.g. `aws-sandbox`). Empty for local/kubeconfig-only clusters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_cloud_profile_id: Option<String>,
+    /// Optional path to an oscar-managed kubeconfig (not the secret itself).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubeconfig_path: Option<String>,
+}
+
+fn cluster_kind_is_unknown(k: &ClusterKind) -> bool {
+    matches!(k, ClusterKind::Unknown)
+}
+
+impl ClusterRef {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            context: None,
+            region: None,
+            kind: ClusterKind::Unknown,
+            linked_cloud_profile_id: None,
+            kubeconfig_path: None,
+        }
+    }
+
+    pub fn with_kind(mut self, kind: ClusterKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub fn with_context(mut self, ctx: impl Into<String>) -> Self {
+        self.context = Some(ctx.into());
+        self
+    }
+
+    pub fn with_region(mut self, region: impl Into<String>) -> Self {
+        self.region = Some(region.into());
+        self
+    }
+
+    pub fn with_linked_cloud_profile(mut self, id: impl Into<String>) -> Self {
+        self.linked_cloud_profile_id = Some(id.into());
+        self
+    }
 }
 
 /// DNS scope for lookups.

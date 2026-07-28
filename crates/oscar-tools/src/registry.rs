@@ -7,12 +7,34 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
 
-/// Inventory of first-class tools. Agent-facing surface is search + execute only.
+/// Inventory of first-class tools.
+///
+/// Agent-facing surface:
+/// - Always: `tools_search` + `tools_execute` (Code Mode for cloud/infra)
+/// - Native (no search): account/access tools — see [`NATIVE_ACCOUNT_TOOL_IDS`]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
 }
 
+/// Account / profile / identity / skills tools mounted as **native** LLM tools (no tools_search).
+pub const NATIVE_ACCOUNT_TOOL_IDS: &[&str] = &[
+    "system.access.review",
+    "system.access.prepare",
+    "system.access.select",
+    "system.profiles.list",
+    "system.identities.list",
+    // Playbooks: create + progressive load without tools_search
+    "system.skills.search",
+    "system.skills.get",
+    "system.skills.create",
+    "system.skills.list",
+];
+
 impl ToolRegistry {
+    pub fn is_native_account_tool(id: &str) -> bool {
+        NATIVE_ACCOUNT_TOOL_IDS.contains(&id)
+    }
+
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
@@ -35,6 +57,16 @@ impl ToolRegistry {
     pub fn get(&self, id: &str) -> Option<Arc<dyn Tool>> {
         if let Some(t) = self.tools.get(id) {
             return Some(t.clone());
+        }
+        // skill.<name> → load via system.skills.get (progressive disclosure)
+        if id.starts_with("skill.") {
+            return self.tools.get("system.skills.get").cloned();
+        }
+        // Narrative / older docs used alternate ids — map to canonical tools.
+        if let Some(canon) = resolve_tool_alias(id) {
+            if let Some(t) = self.tools.get(canon) {
+                return Some(t.clone());
+            }
         }
         // Grok Build names MCP tools `server__tool`; oscar uses `mcp.server.tool`.
         // Accept both so models/scripts can use either form.
@@ -128,23 +160,106 @@ impl ToolRegistry {
                     return Some((0, m.clone()));
                 }
 
+                // Soft multi-token scoring: long queries like
+                // "hosted zones list inventory sync aws dns" used to AND-fail
+                // every token and return 0 hits (zones.list vs inventory.sync).
                 let mut score = 0i32;
+                let mut matched = 0usize;
                 for tok in &tokens {
+                    // Skip ultra-common noise that over-constrains long queries.
+                    if matches!(*tok, "the" | "a" | "an" | "for" | "with" | "and" | "or" | "to") {
+                        continue;
+                    }
+                    let mut hit = false;
                     if m.id.to_ascii_lowercase().contains(tok) {
                         score += 10;
+                        hit = true;
                     }
                     if hay.contains(tok) {
                         score += 3;
-                    } else {
-                        return None;
+                        hit = true;
+                    }
+                    if hit {
+                        matched += 1;
                     }
                 }
+                let meaningful = tokens
+                    .iter()
+                    .filter(|t| {
+                        !matches!(**t, "the" | "a" | "an" | "for" | "with" | "and" | "or" | "to")
+                    })
+                    .count()
+                    .max(1);
+                // Require at least one meaningful token; prefer ≥40% match so
+                // multi-intent queries still surface relevant tools.
+                let min_matched = ((meaningful + 2) / 3).max(1); // ~33%+ ceil
+                if matched < min_matched {
+                    return None;
+                }
+                // Boost denser matches
+                score += (matched as i32) * 2;
                 Some((score, m.clone()))
             })
             .collect();
 
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
-        scored.into_iter().map(|(_, m)| m).collect()
+        let mut out: Vec<ToolMeta> = scored.into_iter().map(|(_, m)| m).collect();
+
+        // Progressive skills in the same search channel (Grok/OpenCode): name+description only.
+        // Exec via tools_execute tool_id=skill.<name> → system.skills.get.
+        // Inject when the query looks playbook-related OR matches skill names strongly —
+        // avoid polluting pure infra queries (e.g. "dns pattern") with skill noise.
+        let skill_query = q.contains("skill")
+            || q.contains("playbook")
+            || q.contains("runbook")
+            || q.contains("when i say")
+            || q.contains("procedure")
+            || q.starts_with("skill.");
+        if !q.is_empty() && (skill_query || out.is_empty()) {
+            let skill_settings = oscar_core::SkillsSettings::default();
+            // Prefer config skills if available
+            let skill_settings = oscar_core::Paths::discover()
+                .ok()
+                .and_then(|p| oscar_core::OscarConfig::load(&p).ok())
+                .map(|c| c.skills)
+                .unwrap_or(skill_settings);
+            let skill_hits = oscar_core::search_skills(&q, &skill_settings, 8);
+            for s in skill_hits {
+                if s.disable_model_invocation {
+                    continue;
+                }
+                let id = format!("skill.{}", s.name);
+                if out.iter().any(|m| m.id == id) {
+                    continue;
+                }
+                out.push(ToolMeta {
+                    id,
+                    name: format!("Skill: {}", s.name),
+                    description: format!(
+                        "[PLAYBOOK] {} — tools_execute this id to load full instructions (progressive disclosure).",
+                        s.description
+                    ),
+                    domain: ToolDomain::Meta,
+                    clouds: vec![Cloud::Multi],
+                    capability: Capability::Read,
+                    tags: vec![
+                        "skill".into(),
+                        "playbook".into(),
+                        s.name.clone(),
+                        s.when_to_use.clone().unwrap_or_default(),
+                    ],
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "optional; defaults from skill.* id" }
+                        }
+                    }),
+                    output_schema: None,
+                });
+            }
+        }
+
+        out
     }
 
     pub async fn execute(
@@ -153,6 +268,21 @@ impl ToolRegistry {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> ToolResult {
+        // skill.<name> → system.skills.get with name extracted (Code Mode exec path)
+        let (tool_id, args) = if let Some(skill_name) = tool_id.strip_prefix("skill.") {
+            let mut a = args;
+            if a.get("name").and_then(|v| v.as_str()).is_none() {
+                if let Some(obj) = a.as_object_mut() {
+                    obj.insert("name".into(), json!(skill_name));
+                } else {
+                    a = json!({ "name": skill_name });
+                }
+            }
+            ("system.skills.get", a)
+        } else {
+            (tool_id, args)
+        };
+
         let Some(tool) = self.get(tool_id) else {
             // Help agent recover: suggest search
             let suggestions = self.search_filtered(tool_id, None, None, None, Some(&ctx.settings));
@@ -170,7 +300,13 @@ impl ToolRegistry {
             return ToolResult::error(hint);
         };
         let meta = tool.meta();
-        if !ctx.settings.is_tool_enabled(tool_id) {
+        // skill.* aliases are always allowed when system.skills.get is enabled
+        let enable_id = if tool_id == "system.skills.get" {
+            "system.skills.get"
+        } else {
+            tool_id
+        };
+        if !ctx.settings.is_tool_enabled(enable_id) {
             return ToolResult::error(format!(
                 "tool_disabled: `{tool_id}` is turned off in user settings (oscar settings enable-tool {tool_id})"
             ));
@@ -231,9 +367,10 @@ impl ToolRegistry {
         tool.execute(args, ctx).await
     }
 
-    /// JSON schemas exposed to the model (fixed two-tool Code Mode surface).
+    /// JSON schemas exposed to the model:
+    /// Code Mode (`tools_search` / `tools_execute`) **plus** native account tools.
     pub fn agent_tool_specs() -> Vec<oscar_providers_stub::ToolSpecLite> {
-        vec![
+        let mut specs = vec![
             oscar_providers_stub::ToolSpecLite {
                 name: "tools_search".into(),
                 description: crate::catalog::tools_search_description(),
@@ -242,7 +379,7 @@ impl ToolRegistry {
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Free-text search across tool id, name, description, tags. Pass an exact tool_id (e.g. aws.dns.pattern.search) to refresh that tool's full schema."
+                            "description": "Free-text search across tool id, name, description, tags. Prefer short 2–4 word queries (e.g. \"aws dns zones\", \"dns pattern\"). Pass an exact tool_id to refresh that tool's full schema. Do NOT search for account tools — call system.access.* / system.profiles.list / system.identities.list directly."
                         },
                         "domain": {
                             "type": "string",
@@ -272,7 +409,7 @@ impl ToolRegistry {
                     "properties": {
                         "tool_id": {
                             "type": "string",
-                            "description": "Stable tool id from tools_search results (e.g. aws.network.pattern.search). Use the `id` field, not the name."
+                            "description": "Stable tool id from tools_search results (e.g. aws.dns.zones.list, aws.dns.pattern.search). Use the `id` field, not the name. Account tools may also be called as native functions without tools_execute."
                         },
                         "arguments": {
                             "type": "object",
@@ -282,7 +419,40 @@ impl ToolRegistry {
                     "required": ["tool_id", "arguments"]
                 }),
             },
-        ]
+        ];
+        // Native account tools — schemas come from registered ToolMeta when available
+        // via code_mode_tool_specs_json; static fallbacks keep compile-time safety.
+        for id in NATIVE_ACCOUNT_TOOL_IDS {
+            if let Some(spec) = native_account_tool_spec_static(id) {
+                specs.push(spec);
+            }
+        }
+        specs
+    }
+
+    /// Build full agent tool specs including live meta from the registry (preferred).
+    pub fn agent_tool_specs_with_registry(&self) -> Vec<oscar_providers_stub::ToolSpecLite> {
+        let mut specs = Self::agent_tool_specs();
+        // Replace static native stubs with live ToolMeta schemas when registered.
+        for id in NATIVE_ACCOUNT_TOOL_IDS {
+            if let Some(tool) = self.get(id) {
+                let m = tool.meta();
+                let live = oscar_providers_stub::ToolSpecLite {
+                    name: m.id.clone(),
+                    description: format!(
+                        "[NATIVE — call directly, no tools_search] {}",
+                        m.description
+                    ),
+                    parameters: m.input_schema.clone(),
+                };
+                if let Some(slot) = specs.iter_mut().find(|s| s.name == *id) {
+                    *slot = live;
+                } else {
+                    specs.push(live);
+                }
+            }
+        }
+        specs
     }
 
     pub fn search_as_json(
@@ -572,6 +742,28 @@ fn when_to_use_for(id: &str) -> &'static str {
 }
 
 /// Map Grok-style `server__tool` or bare `server.tool` to oscar `mcp.server.tool`.
+/// Older narrative / interconnect docs used these ids — resolve to live tools.
+fn resolve_tool_alias(id: &str) -> Option<&'static str> {
+    match id {
+        "aws.network.path.reachability" | "aws.network.reachability" => {
+            Some("aws.network.path.analyze")
+        }
+        "aws.network.path.access" => Some("aws.network.access.analyze"),
+        "gcp.network.path.connectivity_test" | "gcp.network.path.analyze" => {
+            Some("gcp.network.connectivity.test")
+        }
+        "azure.network.path.test_connectivity" | "azure.network.connectivity.test" => {
+            Some("azure.network.path.troubleshoot")
+        }
+        "azure.network.path.next_hop" => Some("azure.network.next_hop"),
+        "network.troubleshoot" | "network.playbook" => Some("network.troubleshoot.playbook"),
+        "network.locate" | "ip.locate" => Some("network.ip.locate"),
+        "envoy.diagnose" | "mesh.diagnose" => Some("mesh.envoy.diagnose"),
+        "node.status" | "node.network.status" => Some("node.net.status"),
+        _ => None,
+    }
+}
+
 fn resolve_mcp_tool_id(id: &str) -> Option<String> {
     let id = id.trim();
     if id.starts_with("mcp.") {
@@ -604,11 +796,118 @@ mod oscar_providers_stub {
 
 impl ToolRegistry {
     pub fn code_mode_tool_specs_json(&self) -> Vec<(String, String, serde_json::Value)> {
-        Self::agent_tool_specs()
+        self.agent_tool_specs_with_registry()
             .into_iter()
             .map(|t| (t.name, t.description, t.parameters))
             .collect()
     }
+}
+
+fn native_account_tool_spec_static(id: &str) -> Option<oscar_providers_stub::ToolSpecLite> {
+    let (description, parameters) = match id {
+        "system.access.review" => (
+            "[NATIVE] List oscar cloud profiles and validity (no secrets). Filter by cloud/account/label. Call directly — do not tools_search for this.".into(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "cloud": { "type": "string", "description": "aws|gcp|azure|k8s" },
+                    "account": { "type": "string", "description": "Account id or label filter (e.g. vdms)" },
+                    "live": { "type": "boolean", "default": true }
+                }
+            }),
+        ),
+        "system.access.prepare" => (
+            "[NATIVE] Create/update a local profile and request secure-bar / SSO auth for a named account (e.g. vdms). Call directly.".into(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "cloud": { "type": "string", "enum": ["aws", "gcp", "azure", "k8s"] },
+                    "label": { "type": "string" },
+                    "account": { "type": "string" },
+                    "region": { "type": "string" },
+                    "profile_id": { "type": "string" },
+                    "prefer": { "type": "string", "enum": ["sso", "session", "keys"] },
+                    "request_auth": { "type": "boolean", "default": true }
+                },
+                "required": ["cloud"]
+            }),
+        ),
+        "system.access.select" => (
+            "[NATIVE] Set or clear session preferred profile so domain tools target that account. Call directly.".into(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "profile_id": { "type": "string" },
+                    "clear": { "type": "boolean", "default": false }
+                }
+            }),
+        ),
+        "system.profiles.list" => (
+            "[NATIVE] List local oscar profiles grouped by CSP. No secrets. Call directly.".into(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "cloud": { "type": "string" }
+                }
+            }),
+        ),
+        "system.identities.list" => (
+            "[NATIVE] Show configured cloud/LLM identities and validity. Call directly.".into(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "live": { "type": "boolean", "default": true }
+                }
+            }),
+        ),
+        "system.skills.search" => (
+            "[NATIVE] Search playbooks by trigger phrase (short hits only). Then system.skills.get or skill.<name>. Call directly.".into(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "default": 10 }
+                },
+                "required": ["query"]
+            }),
+        ),
+        "system.skills.get" => (
+            "[NATIVE] Load full playbook body into the tool result. Call directly (or tools_execute skill.<name>).".into(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" }
+                },
+                "required": ["name"]
+            }),
+        ),
+        "system.skills.create" => (
+            "[NATIVE] Create a user playbook/skill from guidance (when user says X, do Y). Local SKILL.md only — works in readonly. Call directly.".into(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "kebab-case id; optional if guidance given (auto-slug)" },
+                    "description": { "type": "string" },
+                    "when_to_use": { "type": "string" },
+                    "guidance": { "type": "string", "description": "User's natural-language procedure; used to build body if body omitted" },
+                    "body": { "type": "string", "description": "Markdown steps; optional if guidance provided" },
+                    "scope": { "type": "string", "enum": ["user", "project"], "default": "user" },
+                    "allowed_tools": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": []
+            }),
+        ),
+        "system.skills.list" => (
+            "[NATIVE] List skill names/descriptions (no bodies). Call directly.".into(),
+            json!({ "type": "object", "properties": {} }),
+        ),
+        _ => return None,
+    };
+    Some(oscar_providers_stub::ToolSpecLite {
+        name: id.into(),
+        description,
+        parameters,
+    })
 }
 
 /// Parse optional domain string.
@@ -701,6 +1000,60 @@ mod tests {
     }
 
     #[test]
+    fn search_soft_match_long_hosted_zones_query() {
+        let mut reg = ToolRegistry::new();
+        reg.register(dummy("aws.dns.zones.list", vec![Cloud::Aws]));
+        // Enrich dummy name/desc via a second realistic tool
+        reg.register(Arc::new(DummyTool {
+            meta: ToolMeta {
+                id: "aws.dns.inventory.sync".into(),
+                name: "Sync Route 53 inventory".into(),
+                description: "Live-fetch AWS Route 53 public/private hosted zones and records"
+                    .into(),
+                domain: ToolDomain::Dns,
+                clouds: vec![Cloud::Aws],
+                capability: Capability::Read,
+                tags: vec![
+                    "dns".into(),
+                    "sync".into(),
+                    "inventory".into(),
+                    "route53".into(),
+                ],
+                input_schema: json!({}),
+                output_schema: None,
+            },
+        }));
+        reg.register(Arc::new(DummyTool {
+            meta: ToolMeta {
+                id: "aws.dns.zones.list".into(),
+                name: "List Route 53 hosted zones".into(),
+                description: "List public and private Route 53 hosted zones".into(),
+                domain: ToolDomain::Dns,
+                clouds: vec![Cloud::Aws],
+                capability: Capability::Read,
+                tags: vec!["dns".into(), "zones".into(), "list".into(), "hosted".into()],
+                input_schema: json!({}),
+                output_schema: None,
+            },
+        }));
+        let hits = reg.search(
+            "hosted zones list inventory sync aws dns",
+            None,
+            None,
+            None,
+        );
+        let ids: Vec<_> = hits.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            !ids.is_empty(),
+            "long multi-token query must not return 0 hits"
+        );
+        assert!(
+            ids.contains(&"aws.dns.zones.list") || ids.contains(&"aws.dns.inventory.sync"),
+            "expected zone list or inventory sync, got {ids:?}"
+        );
+    }
+
+    #[test]
     fn search_json_includes_schema_and_examples_for_execute() {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(DummyTool {
@@ -790,5 +1143,113 @@ mod tests {
         let out = reg.search_as_json_gated("filesystem__read_file", None, None, None, None, None);
         assert_eq!(out["count"], 1);
         assert_eq!(out["tools"][0]["id"], "mcp.filesystem.read_file");
+    }
+
+    #[test]
+    fn tool_aliases_resolve_path_and_playbook() {
+        assert_eq!(
+            resolve_tool_alias("aws.network.path.reachability"),
+            Some("aws.network.path.analyze")
+        );
+        assert_eq!(
+            resolve_tool_alias("gcp.network.path.connectivity_test"),
+            Some("gcp.network.connectivity.test")
+        );
+        assert_eq!(
+            resolve_tool_alias("azure.network.path.next_hop"),
+            Some("azure.network.next_hop")
+        );
+        let mut reg = ToolRegistry::new();
+        reg.register(dummy("aws.network.path.analyze", vec![Cloud::Aws]));
+        assert!(reg.get("aws.network.path.reachability").is_some());
+        assert_eq!(
+            reg.get("aws.network.path.reachability").unwrap().meta().id,
+            "aws.network.path.analyze"
+        );
+    }
+
+    #[test]
+    fn write_tool_blocked_in_readonly_mode() {
+        use oscar_core::ExecutionMode;
+        use oscar_mode::check_capability;
+
+        // Same gate as ToolRegistry::execute
+        assert!(
+            check_capability(ExecutionMode::ReadOnly, Capability::Write, "aws.network.vpc.create")
+                .is_err()
+        );
+        assert!(
+            check_capability(
+                ExecutionMode::ReadWrite,
+                Capability::Write,
+                "aws.network.vpc.create"
+            )
+            .is_ok()
+        );
+        assert!(
+            check_capability(
+                ExecutionMode::ReadOnly,
+                Capability::Read,
+                "aws.network.vpc.pattern"
+            )
+            .is_ok()
+        );
+        // DNS + network write ids
+        for id in [
+            "aws.network.subnet.delete",
+            "gcp.network.firewall.create",
+            "azure.network.peering.delete",
+            "aws.dns.record.create",
+        ] {
+            assert!(
+                check_capability(ExecutionMode::ReadOnly, Capability::Write, id).is_err(),
+                "{id} must be blocked in readonly"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_search_connectivity_and_envoy_tags() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(DummyTool {
+            meta: ToolMeta {
+                id: "aws.network.path.analyze".into(),
+                name: "path".into(),
+                description: "reachability".into(),
+                domain: ToolDomain::Network,
+                clouds: vec![Cloud::Aws],
+                capability: Capability::Read,
+                tags: vec![
+                    "connectivity".into(),
+                    "analyze".into(),
+                    "troubleshoot".into(),
+                ],
+                input_schema: json!({}),
+                output_schema: None,
+            },
+        }));
+        reg.register(Arc::new(DummyTool {
+            meta: ToolMeta {
+                id: "mesh.envoy.diagnose".into(),
+                name: "envoy diagnose".into(),
+                description: "mesh".into(),
+                domain: ToolDomain::Network,
+                clouds: vec![Cloud::Multi],
+                capability: Capability::Read,
+                tags: vec!["envoy".into(), "mesh".into(), "status".into()],
+                input_schema: json!({}),
+                output_schema: None,
+            },
+        }));
+        let conn = reg.search("connectivity test", Some(ToolDomain::Network), None, None);
+        assert!(
+            conn.iter().any(|m| m.id.contains("path.analyze")),
+            "connectivity should hit path analyze"
+        );
+        let env = reg.search("envoy clusters", None, None, None);
+        assert!(
+            env.iter().any(|m| m.id.contains("envoy")),
+            "envoy query should find mesh tools"
+        );
     }
 }

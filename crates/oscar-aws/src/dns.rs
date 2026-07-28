@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use oscar_core::{Capability, Cloud, PatternQuery, ToolDomain};
 use oscar_tools::{
     auth_for, discovery_blurb, discovery_tool_result, ensure_dns_inventory, load_dns_cache,
-    pattern_properties, resolve_profiles, scan_dns_inventory, to_tool_result, write_dns_cache,
+    pattern_properties, scan_dns_inventory, to_tool_result, write_dns_cache,
     DnsSyncOpts, Tool, ToolContext, ToolMeta, ToolResult,
 };
 use oscar_tools::sync::DnsInventorySource;
@@ -18,10 +18,11 @@ pub struct AwsDnsRecordCreate;
 pub struct AwsDnsRecordDelete;
 
 fn needs_aws(ctx: &ToolContext, reason: &str) -> Option<ToolResult> {
-    if ctx.profiles_for(Cloud::Aws, None).is_empty() {
-        Some(ToolResult::needs_auth(auth_for(Cloud::Aws, reason)))
-    } else {
+    // Any configured AWS profile (not the multi-profile resolve gate).
+    if ctx.profiles.list().iter().any(|p| p.cloud == Cloud::Aws) {
         None
+    } else {
+        Some(ToolResult::needs_auth(auth_for(Cloud::Aws, reason)))
     }
 }
 
@@ -32,7 +33,7 @@ impl Tool for AwsDnsZonesList {
         META.get_or_init(|| ToolMeta {
             id: "aws.dns.zones.list".into(),
             name: "List Route 53 hosted zones".into(),
-            description: "List public and private Route 53 hosted zones. Prefer aws.dns.pattern.search when looking for a name fragment.".into(),
+            description: "Live-list public and private Route 53 hosted zones for a profile (aws route53 list-hosted-zones). Pass profile_id for multi-account (e.g. aws-vdms). Prefer aws.dns.pattern.search when looking for a name fragment like ravix.".into(),
             domain: ToolDomain::Dns,
             clouds: vec![Cloud::Aws],
             capability: Capability::Read,
@@ -41,12 +42,21 @@ impl Tool for AwsDnsZonesList {
                 "route53".into(),
                 "zones".into(),
                 "list".into(),
+                "hosted".into(),
+                "hostedzone".into(),
+                "inventory".into(),
             ],
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "profile_id": { "type": "string" },
-                    "private_only": { "type": "boolean" }
+                    "profile_id": { "type": "string", "description": "Oscar AWS profile id (e.g. aws-vdms)" },
+                    "private_only": { "type": "boolean" },
+                    "public_only": { "type": "boolean" },
+                    "refresh_cache": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "When true (default), live-fetch from Route 53. When false, read inventory cache only."
+                    }
                 }
             }),
             output_schema: None,
@@ -58,38 +68,237 @@ impl Tool for AwsDnsZonesList {
             return r;
         }
         let profile_id = args.get("profile_id").and_then(|v| v.as_str());
-        let profiles = ctx.profiles_for(Cloud::Aws, profile_id);
-        let mut zones = Vec::new();
-        let mut partial = false;
-        for p in profiles {
-            if let Some(inv) = load_dns_cache(&ctx.config_dir, &p.id) {
+        let private_only = args
+            .get("private_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let public_only = args
+            .get("public_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let refresh = args
+            .get("refresh_cache")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        // Multi-profile: require explicit or preferred profile when ambiguous.
+        let profile = match resolve_aws_profile_ctx(ctx, profile_id) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+
+        if !refresh {
+            let mut zones = Vec::new();
+            if let Some(inv) = load_dns_cache(&ctx.config_dir, &profile.id) {
                 for z in inv.zones {
+                    if private_only && !z.private {
+                        continue;
+                    }
+                    if public_only && z.private {
+                        continue;
+                    }
                     zones.push(json!({
-                        "profile_id": p.id,
+                        "profile_id": profile.id,
                         "id": z.id,
                         "name": z.name,
                         "private": z.private,
                         "networks": z.vpc_or_network_ids,
+                        "source": "cache",
                     }));
                 }
-            } else {
-                partial = true;
+            }
+            let summary = format!(
+                "{} zone(s) from cache for profile `{}` (account_ref={})",
+                zones.len(),
+                profile.id,
+                profile.account_ref
+            );
+            return ToolResult::success(
+                summary,
+                json!({
+                    "zones": zones,
+                    "partial": zones.is_empty(),
+                    "profile_id": profile.id,
+                    "account_ref": profile.account_ref,
+                    "source": "cache",
+                }),
+            );
+        }
+
+        // Live Route 53 list (authoritative).
+        let live = match aws_json(
+            &profile,
+            &["route53", "list-hosted-zones", "--output", "json"],
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+
+        // Best-effort STS for honest empty messaging.
+        let (account_id, caller_arn, auth_note) = match aws_json(
+            &profile,
+            &["sts", "get-caller-identity", "--output", "json"],
+        )
+        .await
+        {
+            Ok(id) => (
+                id.get("Account")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                id.get("Arn")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                "keychain_or_session".to_string(),
+            ),
+            Err(_) => (
+                profile.account_ref.clone(),
+                String::new(),
+                "sts_unavailable".to_string(),
+            ),
+        };
+
+        // Pin pending account_ref when we learn the real id.
+        if !account_id.is_empty()
+            && (profile.account_ref == "pending"
+                || profile.account_ref == "unknown"
+                || profile.account_ref.is_empty())
+        {
+            if let Ok(paths) = oscar_core::Paths::discover() {
+                if let Ok(mut store) = oscar_identity::ProfileStore::load(&paths) {
+                    if let Some(p) = store.get(&profile.id).cloned() {
+                        let mut p = p;
+                        p.account_ref = account_id.clone();
+                        store.upsert(p);
+                        let _ = store.save();
+                    }
+                }
             }
         }
-        let summary = if zones.is_empty() && partial {
-            "No cached Route 53 zones — run inventory sync or use aws.dns.pattern.search after sync (live list pending)".into()
-        } else {
-            format!("{} zone(s) from inventory cache", zones.len())
-        };
-        let mut r = ToolResult::success(summary, json!({ "zones": zones, "partial": partial }));
-        if partial {
-            r.diagnostics.push(oscar_core::Diagnostic {
-                code: Some("cache_miss".into()),
-                message: "DNS inventory cache empty for one or more profiles".into(),
-                severity: oscar_core::DiagnosticSeverity::Warning,
-            });
+
+        let mut zones = Vec::new();
+        if let Some(arr) = live.get("HostedZones").and_then(|z| z.as_array()) {
+            for z in arr {
+                let id_raw = z.get("Id").and_then(|v| v.as_str()).unwrap_or("");
+                let id = id_raw.rsplit('/').next().unwrap_or(id_raw);
+                let name = z.get("Name").and_then(|v| v.as_str()).unwrap_or("");
+                let private = z
+                    .pointer("/Config/PrivateZone")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if private_only && !private {
+                    continue;
+                }
+                if public_only && private {
+                    continue;
+                }
+                zones.push(json!({
+                    "profile_id": profile.id,
+                    "id": id,
+                    "name": name,
+                    "private": private,
+                    "record_count": z.get("ResourceRecordSetCount"),
+                    "source": "live",
+                }));
+            }
         }
-        r
+
+        // Merge zone *metadata* into cache without wiping existing records.
+        // Earlier we wrote empty-record inventories and poisoned pattern.search.
+        {
+            use oscar_tools::inventory::{DnsInventory, DnsZoneEntry};
+            use std::collections::HashMap;
+            let mut by_id: HashMap<String, DnsZoneEntry> = load_dns_cache(&ctx.config_dir, &profile.id)
+                .map(|inv| {
+                    inv.zones
+                        .into_iter()
+                        .map(|z| (z.id.clone(), z))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for z in &zones {
+                let Some(id) = z.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let name = z
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let private = z.get("private").and_then(|v| v.as_bool()).unwrap_or(false);
+                if let Some(existing) = by_id.get_mut(id) {
+                    existing.name = name;
+                    existing.private = private;
+                } else {
+                    by_id.insert(
+                        id.to_string(),
+                        DnsZoneEntry {
+                            id: id.to_string(),
+                            name,
+                            private,
+                            vpc_or_network_ids: vec![],
+                            records: vec![],
+                            region: None,
+                        },
+                    );
+                }
+            }
+            let inv = DnsInventory {
+                profile_id: profile.id.clone(),
+                cloud: Cloud::Aws,
+                zones: by_id.into_values().collect(),
+            };
+            let _ = write_dns_cache(&ctx.config_dir, &inv);
+        }
+
+        let summary = if zones.is_empty() {
+            format!(
+                "0 hosted zones in AWS account `{account_id}` via profile `{}` ({auth_note}). \
+                 If you expected zones (e.g. ravix), this profile is on the wrong account or lacks Route53 access — \
+                 store vdms keys with secure bar bulk paste / `oscar auth aws-session --profile {}` and re-run.",
+                profile.id, profile.id
+            )
+        } else {
+            format!(
+                "{} hosted zone(s) in AWS account `{account_id}` via profile `{}`",
+                zones.len(),
+                profile.id
+            )
+        };
+
+        ToolResult::success(
+            summary,
+            json!({
+                "zones": zones,
+                "count": zones.len(),
+                "partial": false,
+                "profile_id": profile.id,
+                "account_id": account_id,
+                "caller_arn": caller_arn,
+                "account_ref_profile": profile.account_ref,
+                "source": "live",
+                "auth_note": auth_note,
+                "empty_guidance": if zones.is_empty() {
+                    json!({
+                        "possible_causes": [
+                            "credentials target a different AWS account than expected",
+                            "no Route 53 hosted zones in this account",
+                            "IAM missing route53:ListHostedZones"
+                        ],
+                        "next_steps": [
+                            "system.access.review cloud=aws account=<label>",
+                            "confirm account_id matches the expected account",
+                            "oscar auth aws-session --profile <id> with keys for the correct account"
+                        ]
+                    })
+                } else {
+                    json!(null)
+                },
+            }),
+        )
     }
 }
 
@@ -99,16 +308,23 @@ impl Tool for AwsDnsRecordLookup {
         static META: std::sync::OnceLock<ToolMeta> = std::sync::OnceLock::new();
         META.get_or_init(|| ToolMeta {
             id: "aws.dns.record.lookup".into(),
-            name: "Lookup Route 53 record (exact)".into(),
-            description: "Exact-ish record lookup by name. For partial/glob discovery use aws.dns.pattern.search.".into(),
+            name: "Lookup Route 53 record (partial)".into(),
+            description: "Find Route 53 records by name fragment (partial match by default). Delegates to aws.dns.pattern.search; pass full FQDN or a short fragment like ravix.".into(),
             domain: ToolDomain::Dns,
             clouds: vec![Cloud::Aws],
             capability: Capability::Read,
-            tags: vec!["dns".into(), "route53".into(), "record".into(), "lookup".into()],
+            tags: vec![
+                "dns".into(),
+                "route53".into(),
+                "record".into(),
+                "lookup".into(),
+                "partial".into(),
+                "search".into(),
+            ],
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string" },
+                    "name": { "type": "string", "description": "Record name or partial fragment" },
                     "type": { "type": "string" },
                     "profile_id": { "type": "string" },
                     "private": { "type": "boolean" },
@@ -125,7 +341,7 @@ impl Tool for AwsDnsRecordLookup {
         if name.is_empty() {
             return ToolResult::error("name is required");
         }
-        // Delegate to pattern search with exact/partial on the name.
+        // Delegate to pattern search with partial match (default for discovery).
         let mut a = args.clone();
         if let Some(obj) = a.as_object_mut() {
             obj.insert("pattern".into(), json!(name));
